@@ -224,7 +224,8 @@ impl<'a> Scheduler<'a> {
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
-        let mut skel = scx_ops_open!(skel_builder, open_object, cluster_ops)?;
+        let open_opts: Option<libbpf_rs::libbpf_sys::bpf_object_open_opts> = None;
+        let mut skel = scx_ops_open!(skel_builder, open_object, cluster_ops, open_opts)?;
 
         skel.struct_ops.cluster_ops_mut().exit_dump_len = opts.exit_dump_len;
 
