@@ -246,13 +246,28 @@ static s32 find_least_loaded_cluster(const struct task_struct *p)
 	return best_cluster;
 }
 
-static const struct cpumask *get_cluster_cpumask(u32 cluster_id)
+/* Pick an idle CPU in the given cluster using cpu_to_cluster_map (no pre-filled cpumask in init). */
+static s32 pick_idle_cpu_in_cluster(struct task_struct *p, s32 prev_cpu, u32 cluster_id)
 {
-	struct cluster_ctx *cctx;
-	if (cluster_id >= nr_clusters) return NULL;
-	cctx = bpf_map_lookup_elem(&cluster_ctx_stor, &cluster_id);
-	if (!cctx || !cctx->cpumask) return NULL;
-	return cast_mask(cctx->cpumask);
+	u64 max_cpus = MIN(nr_cpu_ids, MAX_CPUS);
+	int i;
+	s32 cpu;
+
+	if (cluster_id >= nr_clusters)
+		return -EBUSY;
+	bpf_for(i, 0, max_cpus) {
+		u32 *cid;
+
+		cpu = preferred_cpus[i];
+		cid = bpf_map_lookup_elem(&cpu_to_cluster_map, (const u32 *)&cpu);
+		if (!cid || *cid != cluster_id)
+			continue;
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		if (scx_bpf_test_and_clear_cpu_idle(cpu))
+			return cpu;
+	}
+	return -EBUSY;
 }
 
 static inline bool is_throttled(void) { return READ_ONCE(cpus_throttled); }
@@ -397,18 +412,13 @@ s32 BPF_STRUCT_OPS(cluster_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
 	s32 best_cluster;
-	const struct cpumask *cluster_mask = NULL;
 
 	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
 
 	best_cluster = find_least_loaded_cluster(p);
-	if (best_cluster >= 0)
-		cluster_mask = get_cluster_cpumask((u32)best_cluster);
-
-	/* Try to pick an idle CPU in the least-loaded cluster first */
-	if (cluster_mask) {
-		cpu = pick_idle_cpu_scan(p, prev_cpu, cluster_mask);
+	if (best_cluster >= 0) {
+		cpu = pick_idle_cpu_in_cluster(p, prev_cpu, (u32)best_cluster);
 		if (cpu >= 0) {
 			struct task_ctx *tctx = try_lookup_task_ctx(p);
 			if (tctx) {
@@ -771,34 +781,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cluster_init)
 	if (err)
 		return err;
 
-	bpf_for(i, 0, nr_clusters) {
-		struct cluster_ctx *cctx = bpf_map_lookup_elem(&cluster_ctx_stor, &i);
-		struct bpf_cpumask *cpumask;
-
-		if (!cctx) continue;
-		cpumask = bpf_cpumask_create();
-		if (!cpumask) continue;
-		cpumask = bpf_kptr_xchg(&cctx->cpumask, cpumask);
-		if (cpumask)
-			bpf_cpumask_release(cpumask);
-	}
-
-	/* Fill each cluster's cpumask from cpu_to_cluster_map (already set by userspace before attach) */
-	bpf_for(i, 0, nr_clusters) {
-		struct cluster_ctx *cctx = bpf_map_lookup_elem(&cluster_ctx_stor, &i);
-		s32 cpu;
-
-		if (!cctx) continue;
-		bpf_rcu_read_lock();
-		if (cctx->cpumask) {
-			bpf_for(cpu, 0, nr_cpu_ids) {
-				u32 *cid_ptr = bpf_map_lookup_elem(&cpu_to_cluster_map, (const u32 *)&cpu);
-				if (cid_ptr && *cid_ptr == i)
-					bpf_cpumask_set_cpu(cpu, cctx->cpumask);
-			}
-		}
-		bpf_rcu_read_unlock();
-	}
+	/* Cluster placement uses pick_idle_cpu_in_cluster() + cpu_to_cluster_map; no per-cluster cpumasks in init. */
 
 	timer = bpf_map_lookup_elem(&throttle_timer, &key);
 	if (timer && throttle_ns) {
