@@ -358,19 +358,18 @@ static u64 task_slice(const struct task_struct *p, s32 cpu)
 }
 
 static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
-			 u64 wake_flags, bool from_enqueue,
-			 const struct cpumask *restrict_cpumask)
+			 u64 wake_flags, bool from_enqueue)
 {
 	const struct cpumask *primary = cast_mask(primary_cpumask);
 	s32 cpu;
 
 	if (preferred_idle_scan)
-		return pick_idle_cpu_scan(p, prev_cpu, restrict_cpumask);
+		return pick_idle_cpu_scan(p, prev_cpu, NULL);
 
 	if (no_wake_sync)
 		wake_flags &= ~SCX_WAKE_SYNC;
 
-	if (!restrict_cpumask && primary_all && is_wakeup(wake_flags) && this_cpu >= 0 &&
+	if (primary_all && is_wakeup(wake_flags) && this_cpu >= 0 &&
 	    is_cpu_faster(this_cpu, prev_cpu)) {
 		if (cpus_share_cache(this_cpu, prev_cpu) &&
 		    !is_smt_contended(prev_cpu) &&
@@ -384,12 +383,6 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
 		if (from_enqueue) return -EBUSY;
 		cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 		return is_idle ? cpu : -EBUSY;
-	}
-
-	if (restrict_cpumask) {
-		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, restrict_cpumask, 0);
-		if (cpu >= 0) return cpu;
-		return prev_cpu;
 	}
 
 	if (!primary_all && primary) {
@@ -413,8 +406,22 @@ s32 BPF_STRUCT_OPS(cluster_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	if (best_cluster >= 0)
 		cluster_mask = get_cluster_cpumask((u32)best_cluster);
 
+	/* Try to pick an idle CPU in the least-loaded cluster first */
+	if (cluster_mask) {
+		cpu = pick_idle_cpu_scan(p, prev_cpu, cluster_mask);
+		if (cpu >= 0) {
+			struct task_ctx *tctx = try_lookup_task_ctx(p);
+			if (tctx) {
+				scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu),
+							 task_slice(p, cpu), task_dl(p, cpu, tctx), 0);
+				__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			}
+			return cpu;
+		}
+	}
+
 	cpu = pick_idle_cpu(p, prev_cpu, is_this_cpu_allowed ? this_cpu : -1,
-			    wake_flags, false, cluster_mask);
+			    wake_flags, false);
 	if (cpu >= 0) {
 		struct task_ctx *tctx = try_lookup_task_ctx(p);
 		if (tctx) {
@@ -477,7 +484,7 @@ void BPF_STRUCT_OPS(cluster_enqueue, struct task_struct *p, u64 enq_flags)
 	if (task_should_migrate(p, enq_flags)) {
 		s32 cpu = is_pcpu_task(p) ?
 			(scx_bpf_test_and_clear_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY) :
-			pick_idle_cpu(p, prev_cpu, -1, 0, true, NULL);
+			pick_idle_cpu(p, prev_cpu, -1, 0, true);
 		if (cpu >= 0) {
 			scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu),
 						 task_slice(p, cpu), task_dl(p, cpu, tctx), enq_flags);
