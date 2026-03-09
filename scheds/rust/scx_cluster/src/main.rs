@@ -25,6 +25,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
+use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
@@ -289,8 +290,6 @@ impl<'a> Scheduler<'a> {
 
         skel.struct_ops.cluster_ops_mut().exit_dump_len = opts.exit_dump_len;
 
-        Self::fill_cpu_to_cluster_map(&mut skel, &cpu_to_cluster)?;
-
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.debug = opts.debug;
         rodata.smt_enabled = smt_enabled;
@@ -335,6 +334,8 @@ impl<'a> Scheduler<'a> {
         );
 
         let mut skel = scx_ops_load!(skel, cluster_ops, uei)?;
+
+        Self::fill_cpu_to_cluster_map(&mut skel, &cpu_to_cluster)?;
 
         Self::init_energy_domain(&mut skel, &domain).map_err(|err| {
             anyhow!(
