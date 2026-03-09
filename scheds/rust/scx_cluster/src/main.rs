@@ -101,37 +101,38 @@ fn cpus_to_cpumask(cpus: &[usize]) -> String {
     format!("0x{}", hex_str)
 }
 
+/// Cluster size (CPUs per cluster).
+const CLUSTER_SIZE: usize = 8;
+
 /// Build per-CPU cluster id (dense index 0..nr_clusters-1) and cluster_id -> list of cpus.
-/// Cluster = LLC (L3) domain from topology.
+/// Clusters are fixed-size: each cluster has at most CLUSTER_SIZE CPUs (consecutive by sorted CPU id).
 fn build_cluster_topo(topo: &Topology) -> (Vec<u32>, BTreeMap<u32, Vec<usize>>, u32) {
-    let mut cpu_llc: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut cpus: Vec<usize> = Vec::new();
     for core in topo.all_cores.values() {
-        let llc_id = core.llc_id;
         for cpu_id in core.cpus.keys() {
-            cpu_llc.insert(*cpu_id, llc_id);
+            cpus.push(*cpu_id);
         }
     }
-    let unique_llcs: Vec<usize> = cpu_llc
-        .values()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let nr_clusters = unique_llcs.len() as u32;
-    let llc_to_dense: BTreeMap<usize, u32> = unique_llcs
-        .into_iter()
-        .enumerate()
-        .map(|(i, llc)| (llc, i as u32))
-        .collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+
+    let nr_clusters = if cpus.is_empty() {
+        0
+    } else {
+        ((cpus.len() + CLUSTER_SIZE - 1) / CLUSTER_SIZE) as u32
+    };
+
     let mut cpu_to_cluster: Vec<u32> = vec![0; *NR_CPU_IDS];
     let mut cluster_cpus: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for (cpu_id, &llc_id) in &cpu_llc {
-        let cid = *llc_to_dense.get(&llc_id).unwrap_or(&0);
-        if *cpu_id < cpu_to_cluster.len() {
-            cpu_to_cluster[*cpu_id] = cid;
+
+    for (i, &cpu_id) in cpus.iter().enumerate() {
+        let cid = (i / CLUSTER_SIZE) as u32;
+        if cpu_id < cpu_to_cluster.len() {
+            cpu_to_cluster[cpu_id] = cid;
         }
-        cluster_cpus.entry(cid).or_default().push(*cpu_id);
+        cluster_cpus.entry(cid).or_default().push(cpu_id);
     }
+
     (cpu_to_cluster, cluster_cpus, nr_clusters)
 }
 
@@ -235,7 +236,7 @@ impl<'a> Scheduler<'a> {
         }
 
         let (cpu_to_cluster, cluster_cpus, nr_clusters) = build_cluster_topo(&topo);
-        info!("scx_cluster: {} clusters (LLC domains)", nr_clusters);
+        info!("scx_cluster: {} clusters ({} CPUs per cluster)", nr_clusters, CLUSTER_SIZE);
         for (cluster_id, cpus) in &cluster_cpus {
             let mut cpus_sorted = cpus.clone();
             cpus_sorted.sort_unstable();
