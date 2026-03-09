@@ -65,6 +65,16 @@ struct {
 	__uint(max_entries, MAX_CLUSTERS);
 } cluster_load_map SEC(".maps");
 
+/* Soft mutual exclusion between clusters: tracks how many tasks have
+ * tentatively chosen a cluster in select_cpu but are not yet running.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, MAX_CLUSTERS);
+} cluster_pending_map SEC(".maps");
+
 struct cluster_ctx {
 	struct bpf_cpumask __kptr *cpumask;
 };
@@ -226,7 +236,7 @@ static s32 find_least_loaded_cluster(const struct task_struct *p)
 
 	if (nr_clusters == 0) return -1;
 	bpf_for(cpu, 0, nr_cpu_ids) {
-		u32 *cid_ptr, *load_ptr;
+		u32 *cid_ptr, *load_ptr, *pend_ptr;
 		u32 cid, load;
 
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
@@ -238,6 +248,9 @@ static s32 find_least_loaded_cluster(const struct task_struct *p)
 		load_ptr = bpf_map_lookup_elem(&cluster_load_map, &cid);
 		if (!load_ptr) continue;
 		load = *load_ptr;
+		pend_ptr = bpf_map_lookup_elem(&cluster_pending_map, &cid);
+		if (pend_ptr)
+			load += *pend_ptr;
 		if (load < min_load) {
 			min_load = load;
 			best_cluster = (s32)cid;
@@ -432,7 +445,13 @@ s32 BPF_STRUCT_OPS(cluster_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 
 	best_cluster = find_least_loaded_cluster(p);
 	if (best_cluster >= 0) {
-		cpu = pick_idle_cpu_in_cluster(p, prev_cpu, (u32)best_cluster);
+		u32 cid = (u32)best_cluster;
+		u32 *pend_ptr = bpf_map_lookup_elem(&cluster_pending_map, &cid);
+
+		if (pend_ptr)
+			__sync_fetch_and_add(pend_ptr, 1);
+
+		cpu = pick_idle_cpu_in_cluster(p, prev_cpu, cid);
 		if (cpu >= 0) {
 			struct task_ctx *tctx = try_lookup_task_ctx(p);
 			if (tctx) {
@@ -440,8 +459,13 @@ s32 BPF_STRUCT_OPS(cluster_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 							 task_slice(p, cpu), task_dl(p, cpu, tctx), 0);
 				__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			}
+			if (pend_ptr)
+				__sync_fetch_and_sub(pend_ptr, 1);
 			return cpu;
 		}
+
+		if (pend_ptr)
+			__sync_fetch_and_sub(pend_ptr, 1);
 	}
 
 	cpu = pick_idle_cpu(p, prev_cpu, is_this_cpu_allowed ? this_cpu : -1,
