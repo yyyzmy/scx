@@ -136,7 +136,7 @@ fn build_cluster_topo(topo: &Topology) -> (Vec<u32>, BTreeMap<u32, Vec<usize>>, 
     (cpu_to_cluster, cluster_cpus, nr_clusters)
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 struct Opts {
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
@@ -674,23 +674,52 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
-    if let Some(intv) = opts.monitor.or(opts.stats) {
-        let shutdown_copy = shutdown.clone();
+    if let Some(monitor_intv) = opts.monitor {
+        /* With --monitor, start the scheduler in a background thread first so the stats server
+         * is available; then run the monitor in the main thread. */
+        let opts_sched = opts.clone();
+        let shutdown_sched = shutdown.clone();
         let jh = std::thread::spawn(move || {
-            match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
-                Ok(_) => debug!("stats monitor thread finished successfully"),
-                Err(error_object) => {
-                    warn!(
-                        "stats monitor thread finished because of an error {}",
-                        error_object
-                    )
+            let mut open_object = MaybeUninit::uninit();
+            loop {
+                let mut sched = match Scheduler::init(&opts_sched, &mut open_object) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Scheduler init failed in monitor mode: {e:#}");
+                        break;
+                    }
+                };
+                let uei = match sched.run(shutdown_sched.clone()) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!("Scheduler run error in monitor mode: {e:#}");
+                        break;
+                    }
+                };
+                if !uei.should_restart() {
+                    if !sched.user_restart {
+                        break;
+                    }
                 }
             }
         });
-        if opts.monitor.is_some() {
-            let _ = jh.join();
-            return Ok(());
+        match stats::monitor(Duration::from_secs_f64(monitor_intv), shutdown) {
+            Ok(_) => debug!("stats monitor finished successfully"),
+            Err(e) => warn!("stats monitor error: {e:#}"),
         }
+        let _ = jh.join();
+        return Ok(());
+    }
+
+    if opts.stats.is_some() {
+        let shutdown_copy = shutdown.clone();
+        let intv = opts.stats.unwrap();
+        let _jh = std::thread::spawn(move || {
+            match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
+                Ok(_) => debug!("stats monitor thread finished successfully"),
+                Err(e) => warn!("stats monitor thread error: {e:#}"),
+            }
+        });
     }
 
     let mut open_object = MaybeUninit::uninit();
