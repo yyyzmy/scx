@@ -213,6 +213,7 @@ struct Scheduler<'a> {
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
+    nr_clusters: u32,
 }
 
 impl<'a> Scheduler<'a> {
@@ -380,6 +381,7 @@ impl<'a> Scheduler<'a> {
             power_profile,
             stats_server,
             user_restart: false,
+            nr_clusters,
         })
     }
 
@@ -561,12 +563,33 @@ impl<'a> Scheduler<'a> {
 
     fn get_metrics(&self) -> Metrics {
         let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
+        let mut cluster_loads = Vec::with_capacity(self.nr_clusters as usize);
+        for cid in 0..self.nr_clusters {
+            let key = cid.to_ne_bytes();
+            let load = self
+                .skel
+                .maps
+                .cluster_load_map
+                .lookup(&key, MapFlags::ANY)
+                .ok()
+                .and_then(|o| o)
+                .and_then(|v| {
+                    if v.len() >= 4 {
+                        Some(u32::from_ne_bytes(v[0..4].try_into().unwrap()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            cluster_loads.push(load);
+        }
         Metrics {
             nr_running: bss_data.nr_running,
             nr_cpus: bss_data.nr_online_cpus,
             nr_kthread_dispatches: bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_shared_dispatches: bss_data.nr_shared_dispatches,
+            cluster_loads,
         }
     }
 

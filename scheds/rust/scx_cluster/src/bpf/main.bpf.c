@@ -416,6 +416,20 @@ s32 BPF_STRUCT_OPS(cluster_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
 
+	/* Task already bound: only one CPU or migration disabled — use that CPU, no cluster search */
+	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
+		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			struct task_ctx *tctx = try_lookup_task_ctx(p);
+			if (tctx) {
+				scx_bpf_dsq_insert_vtime(p, cpu_dsq(prev_cpu),
+							 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), 0);
+				__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			}
+			return prev_cpu;
+		}
+		return prev_cpu;
+	}
+
 	best_cluster = find_least_loaded_cluster(p);
 	if (best_cluster >= 0) {
 		cpu = pick_idle_cpu_in_cluster(p, prev_cpu, (u32)best_cluster);

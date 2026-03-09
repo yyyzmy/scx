@@ -25,6 +25,8 @@ pub struct Metrics {
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Number of regular task dispatches")]
     pub nr_shared_dispatches: u64,
+    #[stat(desc = "Running task count per cluster")]
+    pub cluster_loads: Vec<u32>,
 }
 
 impl Metrics {
@@ -39,6 +41,15 @@ impl Metrics {
             self.nr_direct_dispatches,
             self.nr_shared_dispatches
         )?;
+        if !self.cluster_loads.is_empty() {
+            let loads: Vec<String> = self
+                .cluster_loads
+                .iter()
+                .enumerate()
+                .map(|(c, &n)| format!("{}:{}", c, n))
+                .collect();
+            writeln!(w, "  cluster tasks: [{}]", loads.join(", "))?;
+        }
         Ok(())
     }
 
@@ -47,6 +58,7 @@ impl Metrics {
             nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
+            cluster_loads: self.cluster_loads.clone(),
             ..self.clone()
         }
     }
