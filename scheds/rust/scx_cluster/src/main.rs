@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// scx_cluster: cluster-aware scheduler based on scx_bpfland.
+// scx_cluster: cluster-aware sched_ext scheduler based on scx_bpfland.
 // Evenly distributes processes across LLC (L3) clusters.
 
 mod bpf_skel;
@@ -11,23 +11,21 @@ pub use bpf_intf::*;
 mod stats;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::ffi::c_int;
-use std::fs::File;
-use std::io::Read;
+use std::ffi::{c_int, c_ulong};
+use std::fmt::Write;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::MapFlags;
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 use log::warn;
@@ -35,12 +33,13 @@ use log::{debug, info};
 use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
-use scx_utils::import_enums;
-use scx_utils::scx_enums;
+use scx_utils::compat;
+use scx_utils::libbpf_clap_opts::LibbpfOpts;
+use scx_utils::pm::{cpu_idle_resume_latency_supported, update_cpu_idle_resume_latency};
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
-use scx_utils::set_rlimit_infinity;
+use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
 use scx_utils::CoreType;
@@ -50,10 +49,11 @@ use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 use stats::Metrics;
 
-const SCHEDULER_NAME: &'static str = "scx_cluster";
+const SCHEDULER_NAME: &str = "scx_cluster";
 
 #[derive(PartialEq)]
 enum Powermode {
+    Turbo,
     Performance,
     Powersave,
     Any,
@@ -61,6 +61,7 @@ enum Powermode {
 
 fn get_primary_cpus(mode: Powermode) -> std::io::Result<Vec<usize>> {
     let topo = Topology::new().unwrap();
+
     let cpus: Vec<usize> = topo
         .all_cores
         .values()
@@ -72,21 +73,30 @@ fn get_primary_cpus(mode: Powermode) -> std::io::Result<Vec<usize>> {
             _ => None,
         })
         .collect();
+
     Ok(cpus)
 }
 
-fn cpus_to_cpumask(cpus: &Vec<usize>) -> String {
+fn cpus_to_cpumask(cpus: &[usize]) -> String {
     if cpus.is_empty() {
         return String::from("none");
     }
+
     let max_cpu_id = *cpus.iter().max().unwrap();
+
     let mut bitmask = vec![0u8; (max_cpu_id + 1 + 7) / 8];
+
     for cpu_id in cpus {
         let byte_index = cpu_id / 8;
         let bit_index = cpu_id % 8;
         bitmask[byte_index] |= 1 << bit_index;
     }
-    let hex_str: String = bitmask.iter().rev().map(|byte| format!("{:02x}", byte)).collect();
+
+    let hex_str: String = bitmask.iter().rev().fold(String::new(), |mut f, byte| {
+        let _ = write!(&mut f, "{:02x}", byte);
+        f
+    });
+
     format!("0x{}", hex_str)
 }
 
@@ -100,7 +110,12 @@ fn build_cluster_topo(topo: &Topology) -> (Vec<u32>, BTreeMap<u32, Vec<usize>>, 
             cpu_llc.insert(*cpu_id, llc_id);
         }
     }
-    let unique_llcs: Vec<usize> = cpu_llc.values().cloned().collect::<BTreeSet<_>>().into_iter().collect();
+    let unique_llcs: Vec<usize> = cpu_llc
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let nr_clusters = unique_llcs.len() as u32;
     let llc_to_dense: BTreeMap<usize, u32> = unique_llcs
         .into_iter()
@@ -124,17 +139,20 @@ struct Opts {
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
 
-    #[clap(short = 's', long, default_value = "20000")]
+    #[clap(short = 's', long, default_value = "1000")]
     slice_us: u64,
 
-    #[clap(short = 'S', long, default_value = "1000")]
-    slice_us_min: u64,
+    #[clap(short = 'L', long, default_value = "0")]
+    slice_min_us: u64,
 
-    #[clap(short = 'l', long, allow_hyphen_values = true, default_value = "20000")]
-    slice_us_lag: i64,
+    #[clap(short = 'l', long, default_value = "40000")]
+    slice_us_lag: u64,
 
-    #[clap(short = 'n', long, action = clap::ArgAction::SetTrue)]
-    no_preempt: bool,
+    #[clap(short = 't', long, default_value = "0")]
+    throttle_us: u64,
+
+    #[clap(short = 'I', long, allow_hyphen_values = true, default_value = "-1")]
+    idle_resume_us: i64,
 
     #[clap(short = 'p', long, action = clap::ArgAction::SetTrue)]
     local_pcpu: bool,
@@ -142,20 +160,26 @@ struct Opts {
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
+    #[clap(short = 'w', long, action = clap::ArgAction::SetTrue)]
+    no_wake_sync: bool,
+
+    #[clap(short = 'S', long, action = clap::ArgAction::SetTrue)]
+    sticky_tasks: bool,
+
     #[clap(short = 'm', long, default_value = "auto")]
     primary_domain: String,
 
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    disable_l2: bool,
+    #[clap(short = 'P', long, action = clap::ArgAction::SetTrue)]
+    preferred_idle_scan: bool,
 
     #[clap(long, action = clap::ArgAction::SetTrue)]
-    disable_l3: bool,
+    disable_smt: bool,
+
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    disable_numa: bool,
 
     #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
     cpufreq: bool,
-
-    #[clap(short = 'c', long, default_value = "10", hide = true)]
-    nvcsw_max_thresh: u64,
 
     #[clap(long)]
     stats: Option<f64>,
@@ -174,19 +198,16 @@ struct Opts {
 
     #[clap(long)]
     help_stats: bool,
-}
 
-fn is_smt_active() -> std::io::Result<i32> {
-    let mut file = File::open("/sys/devices/system/cpu/smt/active")?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    Ok(contents.trim().parse().unwrap_or(0))
+    #[clap(flatten, next_help_heading = "Libbpf Options")]
+    pub libbpf: LibbpfOpts,
 }
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     opts: &'a Opts,
+    topo: Topology,
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
@@ -194,21 +215,24 @@ struct Scheduler<'a> {
 
 impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
-        set_rlimit_infinity();
-        assert!(opts.slice_us >= opts.slice_us_min);
-
-        let smt_enabled = match is_smt_active() {
-            Ok(value) => value == 1,
-            Err(_) => false,
-        };
-        info!(
-            "{} {} {}",
-            SCHEDULER_NAME,
-            build_id::full_version(env!("CARGO_PKG_VERSION")),
-            if smt_enabled { "SMT on" } else { "SMT off" }
-        );
+        try_set_rlimit_infinity();
 
         let topo = Topology::new().unwrap();
+
+        let smt_enabled = !opts.disable_smt && topo.smt_enabled;
+
+        let nr_nodes = topo
+            .nodes
+            .values()
+            .filter(|node| !node.all_cpus.is_empty())
+            .count();
+        info!("NUMA nodes: {}", nr_nodes);
+
+        let numa_enabled = !opts.disable_numa && nr_nodes > 1;
+        if !numa_enabled {
+            info!("Disabling NUMA optimizations");
+        }
+
         let (cpu_to_cluster, cluster_cpus, nr_clusters) = build_cluster_topo(&topo);
         info!("scx_cluster: {} clusters (LLC domains)", nr_clusters);
         for (cluster_id, cpus) in &cluster_cpus {
@@ -222,45 +246,117 @@ impl<'a> Scheduler<'a> {
             );
         }
 
+        let power_profile = Self::power_profile();
+        let domain =
+            Self::resolve_energy_domain(&opts.primary_domain, power_profile).map_err(|err| {
+                anyhow!(
+                    "failed to resolve primary domain '{}': {}",
+                    &opts.primary_domain,
+                    err
+                )
+            })?;
+
+        info!(
+            "{} {} {}",
+            SCHEDULER_NAME,
+            build_id::full_version(env!("CARGO_PKG_VERSION")),
+            if smt_enabled { "SMT on" } else { "SMT off" }
+        );
+
+        info!(
+            "scheduler options: {}",
+            std::env::args().collect::<Vec<_>>().join(" ")
+        );
+
+        if opts.idle_resume_us >= 0 {
+            if !cpu_idle_resume_latency_supported() {
+                warn!("idle resume latency not supported");
+            } else {
+                info!("Setting idle QoS to {} us", opts.idle_resume_us);
+                for cpu in topo.all_cpus.values() {
+                    update_cpu_idle_resume_latency(
+                        cpu.id,
+                        opts.idle_resume_us.try_into().unwrap(),
+                    )?;
+                }
+            }
+        }
+
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
-        let open_opts: Option<libbpf_rs::libbpf_sys::bpf_object_open_opts> = None;
+        let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, cluster_ops, open_opts)?;
 
         skel.struct_ops.cluster_ops_mut().exit_dump_len = opts.exit_dump_len;
 
-        skel.maps.rodata_data.debug = opts.debug;
-        skel.maps.rodata_data.smt_enabled = smt_enabled;
-        skel.maps.rodata_data.local_pcpu = opts.local_pcpu;
-        skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
-        skel.maps.rodata_data.no_preempt = opts.no_preempt;
-        skel.maps.rodata_data.slice_max = opts.slice_us * 1000;
-        skel.maps.rodata_data.slice_min = opts.slice_us_min * 1000;
-        skel.maps.rodata_data.slice_lag = opts.slice_us_lag * 1000;
-        skel.maps.rodata_data.nr_clusters = nr_clusters;
+        Self::fill_cpu_to_cluster_map(&mut skel, &cpu_to_cluster)?;
+
+        let rodata = skel.maps.rodata_data.as_mut().unwrap();
+        rodata.debug = opts.debug;
+        rodata.smt_enabled = smt_enabled;
+        rodata.numa_enabled = numa_enabled;
+        rodata.local_pcpu = opts.local_pcpu;
+        rodata.no_wake_sync = opts.no_wake_sync;
+        rodata.sticky_tasks = opts.sticky_tasks;
+        rodata.slice_max = opts.slice_us * 1000;
+        rodata.slice_min = opts.slice_min_us * 1000;
+        rodata.slice_lag = opts.slice_us_lag * 1000;
+        rodata.throttle_ns = opts.throttle_us * 1000;
+        rodata.primary_all = domain.weight() == *NR_CPU_IDS;
+        rodata.nr_clusters = nr_clusters;
+
+        let mut cpus: Vec<_> = topo.all_cpus.values().collect();
+        cpus.sort_by_key(|cpu| std::cmp::Reverse(cpu.cpu_capacity));
+        for (i, cpu) in cpus.iter().enumerate() {
+            rodata.cpu_capacity[cpu.id] = cpu.cpu_capacity as c_ulong;
+            rodata.preferred_cpus[i] = cpu.id as u64;
+        }
+        if opts.preferred_idle_scan {
+            info!(
+                "Preferred CPUs: {:?}",
+                &rodata.preferred_cpus[0..cpus.len()]
+            );
+        }
+        rodata.preferred_idle_scan = opts.preferred_idle_scan;
+        rodata.local_kthreads = opts.local_kthreads || opts.throttle_us > 0;
+
+        skel.struct_ops.cluster_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
+            | *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP
+            | if numa_enabled {
+                *compat::SCX_OPS_BUILTIN_IDLE_PER_NODE
+            } else {
+                0
+            };
+        info!(
+            "scheduler flags: {:#x}",
+            skel.struct_ops.cluster_ops_mut().flags
+        );
 
         let mut skel = scx_ops_load!(skel, cluster_ops, uei)?;
 
-        let power_profile = fetch_power_profile(false);
-        if let Err(err) = Self::init_energy_domain(&mut skel, &opts.primary_domain, power_profile) {
-            warn!("failed to initialize primary domain: error {}", err);
-        }
+        Self::init_energy_domain(&mut skel, &domain).map_err(|err| {
+            anyhow!(
+                "failed to initialize primary domain 0x{:x}: {}",
+                domain,
+                err
+            )
+        })?;
+
         if let Err(err) = Self::init_cpufreq_perf(&mut skel, &opts.primary_domain, opts.cpufreq) {
-            warn!("failed to initialize cpufreq performance level: error {}", err);
+            bail!(
+                "failed to initialize cpufreq performance level: error {}",
+                err
+            );
         }
 
-        if !opts.disable_l2 {
-            Self::init_l2_cache_domains(&mut skel, &topo)?;
+        if smt_enabled {
+            Self::init_smt_domains(&mut skel, &topo)?;
         }
-        if !opts.disable_l3 {
-            Self::init_l3_cache_domains(&mut skel, &topo)?;
-        }
-
-        Self::fill_cpu_to_cluster_map(&mut skel, &cpu_to_cluster)?;
 
         let struct_ops = Some(scx_ops_attach!(skel, cluster_ops)?);
 
-        /* After attach, cluster_init has created per-cluster cpumasks; fill them via enable_cluster_cpu */
         Self::enable_cluster_cpus(&mut skel, &cluster_cpus)?;
 
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
@@ -269,6 +365,7 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops,
             opts,
+            topo,
             power_profile,
             stats_server,
             user_restart: false,
@@ -285,7 +382,9 @@ impl<'a> Scheduler<'a> {
             }
             let key = (cpu_id as u32).to_ne_bytes();
             let val = cluster_id.to_ne_bytes();
-            skel.maps.cpu_to_cluster_map.update(&key, &val, MapFlags::ANY)?;
+            skel.maps
+                .cpu_to_cluster_map
+                .update(&key, &val, MapFlags::ANY)?;
         }
         Ok(())
     }
@@ -324,7 +423,9 @@ impl<'a> Scheduler<'a> {
 
     fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
         let prog = &mut skel.progs.enable_primary_cpu;
-        let mut args = cpu_arg { cpu_id: cpu as c_int };
+        let mut args = cpu_arg {
+            cpu_id: cpu as c_int,
+        };
         let input = ProgramInput {
             context_in: Some(unsafe {
                 std::slice::from_raw_parts_mut(
@@ -338,6 +439,7 @@ impl<'a> Scheduler<'a> {
         if out.return_value != 0 {
             return Err(out.return_value);
         }
+
         Ok(())
     }
 
@@ -349,37 +451,39 @@ impl<'a> Scheduler<'a> {
         Cpumask::from_str(&cpus_to_cpumask(&cpus))
     }
 
-    fn init_energy_domain(
-        skel: &mut BpfSkel<'_>,
-        primary_domain: &str,
-        power_profile: PowerProfile,
-    ) -> Result<()> {
+    fn resolve_energy_domain(primary_domain: &str, power_profile: PowerProfile) -> Result<Cpumask> {
         let domain = match primary_domain {
             "powersave" => Self::epp_to_cpumask(Powermode::Powersave)?,
             "performance" => Self::epp_to_cpumask(Powermode::Performance)?,
+            "turbo" => Self::epp_to_cpumask(Powermode::Turbo)?,
             "auto" => match power_profile {
                 PowerProfile::Powersave => Self::epp_to_cpumask(Powermode::Powersave)?,
-                PowerProfile::Performance | PowerProfile::Balanced => {
-                    Self::epp_to_cpumask(Powermode::Performance)?
-                }
-                PowerProfile::Unknown => Self::epp_to_cpumask(Powermode::Any)?,
+                PowerProfile::Balanced { .. }
+                | PowerProfile::Performance
+                | PowerProfile::Unknown => Self::epp_to_cpumask(Powermode::Any)?,
             },
             "all" => Self::epp_to_cpumask(Powermode::Any)?,
             _ => Cpumask::from_str(primary_domain)?,
         };
 
+        Ok(domain)
+    }
+
+    fn init_energy_domain(skel: &mut BpfSkel<'_>, domain: &Cpumask) -> Result<()> {
         info!("primary CPU domain = 0x{:x}", domain);
 
         if let Err(err) = Self::enable_primary_cpu(skel, -1) {
-            warn!("failed to reset primary domain: error {}", err);
+            bail!("failed to reset primary domain: error {}", err);
         }
+
         for cpu in 0..*NR_CPU_IDS {
             if domain.test_cpu(cpu) {
                 if let Err(err) = Self::enable_primary_cpu(skel, cpu as i32) {
-                    warn!("failed to add CPU {} to primary domain: error {}", cpu, err);
+                    bail!("failed to add CPU {} to primary domain: error {}", cpu, err);
                 }
             }
         }
+
         Ok(())
     }
 
@@ -402,15 +506,26 @@ impl<'a> Scheduler<'a> {
                 _ => perf_lvl.to_string(),
             }
         );
-        skel.maps.bss_data.cpufreq_perf_lvl = perf_lvl;
+        skel.maps.bss_data.as_mut().unwrap().cpufreq_perf_lvl = perf_lvl;
+
         Ok(())
+    }
+
+    fn power_profile() -> PowerProfile {
+        let profile = fetch_power_profile(true);
+        if profile == PowerProfile::Unknown {
+            fetch_power_profile(false)
+        } else {
+            profile
+        }
     }
 
     fn refresh_sched_domain(&mut self) -> bool {
         if self.power_profile != PowerProfile::Unknown {
-            let power_profile = fetch_power_profile(false);
+            let power_profile = Self::power_profile();
             if power_profile != self.power_profile {
                 self.power_profile = power_profile;
+
                 if self.opts.primary_domain == "auto" {
                     return true;
                 }
@@ -423,18 +538,17 @@ impl<'a> Scheduler<'a> {
                 }
             }
         }
+
         false
     }
 
     fn enable_sibling_cpu(
         skel: &mut BpfSkel<'_>,
-        lvl: usize,
         cpu: usize,
         sibling_cpu: usize,
     ) -> Result<(), u32> {
         let prog = &mut skel.progs.enable_sibling_cpu;
         let mut args = domain_arg {
-            lvl_id: lvl as c_int,
             cpu_id: cpu as c_int,
             sibling_cpu_id: sibling_cpu as c_int,
         };
@@ -451,62 +565,29 @@ impl<'a> Scheduler<'a> {
         if out.return_value != 0 {
             return Err(out.return_value);
         }
+
         Ok(())
     }
 
-    fn init_cache_domains(
-        skel: &mut BpfSkel<'_>,
-        topo: &Topology,
-        cache_lvl: usize,
-        enable_sibling_cpu_fn: &dyn Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>,
-    ) -> Result<(), std::io::Error> {
-        let mut cache_id_map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for core in topo.all_cores.values() {
-            for (cpu_id, cpu) in &core.cpus {
-                let cache_id = match cache_lvl {
-                    2 => cpu.l2_id,
-                    3 => cpu.llc_id,
-                    _ => panic!("invalid cache level {}", cache_lvl),
-                };
-                cache_id_map.entry(cache_id).or_default().push(*cpu_id);
-            }
+    fn init_smt_domains(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<(), std::io::Error> {
+        let smt_siblings = topo.sibling_cpus();
+
+        info!("SMT sibling CPUs: {:?}", smt_siblings);
+        for (cpu, sibling_cpu) in smt_siblings.iter().enumerate() {
+            Self::enable_sibling_cpu(skel, cpu, *sibling_cpu as usize).unwrap();
         }
-        for (cache_id, cpus) in cache_id_map {
-            for cpu in &cpus {
-                for sibling_cpu in &cpus {
-                    if let Err(_) = enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu) {
-                        warn!(
-                            "L{} cache ID {}: failed to set CPU {} sibling {}",
-                            cache_lvl, cache_id, *cpu, *sibling_cpu
-                        );
-                    }
-                }
-            }
-        }
+
         Ok(())
-    }
-
-    fn init_l2_cache_domains(
-        skel: &mut BpfSkel<'_>,
-        topo: &Topology,
-    ) -> Result<(), std::io::Error> {
-        Self::init_cache_domains(skel, topo, 2, &|s, l, c, sc| Self::enable_sibling_cpu(s, l, c, sc))
-    }
-
-    fn init_l3_cache_domains(
-        skel: &mut BpfSkel<'_>,
-        topo: &Topology,
-    ) -> Result<(), std::io::Error> {
-        Self::init_cache_domains(skel, topo, 3, &|s, l, c, sc| Self::enable_sibling_cpu(s, l, c, sc))
     }
 
     fn get_metrics(&self) -> Metrics {
+        let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
         Metrics {
-            nr_running: self.skel.maps.bss_data.nr_running,
-            nr_cpus: self.skel.maps.bss_data.nr_online_cpus,
-            nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
-            nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
-            nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
+            nr_running: bss_data.nr_running,
+            nr_cpus: bss_data.nr_online_cpus,
+            nr_kthread_dispatches: bss_data.nr_kthread_dispatches,
+            nr_direct_dispatches: bss_data.nr_direct_dispatches,
+            nr_shared_dispatches: bss_data.nr_shared_dispatches,
         }
     }
 
@@ -527,14 +608,27 @@ impl<'a> Scheduler<'a> {
                 Err(e) => Err(e)?,
             }
         }
-        self.struct_ops.take();
+
+        let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
 }
 
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
-        info!("Unregister {} scheduler", SCHEDULER_NAME);
+        info!("Unregister {SCHEDULER_NAME} scheduler");
+
+        if self.opts.idle_resume_us >= 0 {
+            if cpu_idle_resume_latency_supported() {
+                for cpu in self.topo.all_cpus.values() {
+                    update_cpu_idle_resume_latency(
+                        cpu.id,
+                        cpu.pm_qos_resume_latency_us as i32,
+                    )
+                    .unwrap();
+                }
+            }
+        }
     }
 }
 
@@ -556,8 +650,11 @@ fn main() -> Result<()> {
     }
 
     let loglevel = simplelog::LevelFilter::Info;
+
     let mut lcfg = simplelog::ConfigBuilder::new();
-    lcfg.set_time_level(simplelog::LevelFilter::Error)
+    lcfg.set_time_offset_to_local()
+        .expect("Failed to set local time offset")
+        .set_time_level(simplelog::LevelFilter::Error)
         .set_location_level(simplelog::LevelFilter::Off)
         .set_target_level(simplelog::LevelFilter::Off)
         .set_thread_level(simplelog::LevelFilter::Off);
@@ -580,7 +677,12 @@ fn main() -> Result<()> {
         let jh = std::thread::spawn(move || {
             match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
                 Ok(_) => debug!("stats monitor thread finished successfully"),
-                Err(e) => warn!("stats monitor thread finished with error {}", e),
+                Err(error_object) => {
+                    warn!(
+                        "stats monitor thread finished because of an error {}",
+                        error_object
+                    )
+                }
             }
         });
         if opts.monitor.is_some() {
