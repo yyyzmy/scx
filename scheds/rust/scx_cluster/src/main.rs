@@ -333,7 +333,16 @@ impl<'a> Scheduler<'a> {
             skel.struct_ops.cluster_ops_mut().flags
         );
 
-        let mut skel = scx_ops_load!(skel, cluster_ops, uei)?;
+        let mut skel = match scx_ops_load!(skel, cluster_ops, uei) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!(
+                    "Failed to load BPF program. Full error: {e:#}. \
+                     To pinpoint: run 'strace -f -e bpf ./scx_cluster 2>&1' and look for bpf(...)= -1 EACCES (13)."
+                );
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+        };
 
         Self::fill_cpu_to_cluster_map(&mut skel, &cpu_to_cluster)?;
 
@@ -358,7 +367,7 @@ impl<'a> Scheduler<'a> {
 
         let struct_ops = Some(scx_ops_attach!(skel, cluster_ops)?);
 
-        Self::enable_cluster_cpus(&mut skel, &cluster_cpus)?;
+        // Cluster cpumasks are filled in BPF cluster_init from cpu_to_cluster_map (no syscall program)
 
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
@@ -386,38 +395,6 @@ impl<'a> Scheduler<'a> {
             skel.maps
                 .cpu_to_cluster_map
                 .update(&key, &val, MapFlags::ANY)?;
-        }
-        Ok(())
-    }
-
-    fn enable_cluster_cpus(
-        skel: &mut BpfSkel<'_>,
-        cluster_cpus: &BTreeMap<u32, Vec<usize>>,
-    ) -> Result<()> {
-        let prog = &mut skel.progs.enable_cluster_cpu;
-        for (&cluster_id, cpus) in cluster_cpus {
-            for &cpu_id in cpus {
-                let mut args = cluster_cpu_arg {
-                    cluster_id: cluster_id as i32,
-                    cpu_id: cpu_id as i32,
-                };
-                let input = ProgramInput {
-                    context_in: Some(unsafe {
-                        std::slice::from_raw_parts_mut(
-                            &mut args as *mut _ as *mut u8,
-                            std::mem::size_of_val(&args),
-                        )
-                    }),
-                    ..Default::default()
-                };
-                let out = prog.test_run(input).unwrap();
-                if out.return_value != 0 {
-                    warn!(
-                        "enable_cluster_cpu(cluster={}, cpu={}) failed: {}",
-                        cluster_id, cpu_id, out.return_value
-                    );
-                }
-            }
         }
         Ok(())
     }

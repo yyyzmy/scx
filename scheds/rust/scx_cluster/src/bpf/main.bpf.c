@@ -661,36 +661,6 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 SEC("syscall")
-int enable_cluster_cpu(struct cluster_cpu_arg *input)
-{
-	struct cluster_ctx *cctx;
-	struct bpf_cpumask *mask;
-	int err = 0;
-
-	if (input->cluster_id < 0 || (u32)input->cluster_id >= nr_clusters)
-		return -EINVAL;
-
-	cctx = bpf_map_lookup_elem(&cluster_ctx_stor, (const u32 *)&input->cluster_id);
-	if (!cctx)
-		return -ENOENT;
-
-	if (!cctx->cpumask) {
-		mask = bpf_cpumask_create();
-		if (!mask)
-			return -ENOMEM;
-		mask = bpf_kptr_xchg(&cctx->cpumask, mask);
-		if (mask)
-			bpf_cpumask_release(mask);
-	}
-	bpf_rcu_read_lock();
-	mask = cctx->cpumask;
-	if (mask && input->cpu_id >= 0)
-		bpf_cpumask_set_cpu(input->cpu_id, mask);
-	bpf_rcu_read_unlock();
-	return err;
-}
-
-SEC("syscall")
 int enable_sibling_cpu(struct domain_arg *input)
 {
 	struct cpu_ctx *cctx;
@@ -811,6 +781,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cluster_init)
 		cpumask = bpf_kptr_xchg(&cctx->cpumask, cpumask);
 		if (cpumask)
 			bpf_cpumask_release(cpumask);
+	}
+
+	/* Fill each cluster's cpumask from cpu_to_cluster_map (already set by userspace before attach) */
+	bpf_for(i, 0, nr_clusters) {
+		struct cluster_ctx *cctx = bpf_map_lookup_elem(&cluster_ctx_stor, &i);
+		s32 cpu;
+
+		if (!cctx) continue;
+		bpf_rcu_read_lock();
+		if (cctx->cpumask) {
+			bpf_for(cpu, 0, nr_cpu_ids) {
+				u32 *cid_ptr = bpf_map_lookup_elem(&cpu_to_cluster_map, (const u32 *)&cpu);
+				if (cid_ptr && *cid_ptr == i)
+					bpf_cpumask_set_cpu(cpu, cctx->cpumask);
+			}
+		}
+		bpf_rcu_read_unlock();
 	}
 
 	timer = bpf_map_lookup_elem(&throttle_timer, &key);
