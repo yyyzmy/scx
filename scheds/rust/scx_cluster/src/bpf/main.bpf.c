@@ -50,6 +50,7 @@ const volatile u32 nr_clusters;
 const volatile bool smt_enabled = true;
 const volatile bool numa_enabled = true;
 static u64 vtime_now;
+static volatile u32 rr_next_cluster;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -259,6 +260,50 @@ static s32 find_least_loaded_cluster(const struct task_struct *p)
 	return best_cluster;
 }
 
+static bool cluster_has_allowed_cpu(const struct task_struct *p, u32 cluster_id)
+{
+	u64 max_cpus = MIN(nr_cpu_ids, MAX_CPUS);
+	int i;
+	s32 cpu;
+
+	if (cluster_id >= nr_clusters)
+		return false;
+
+	bpf_for(i, 0, max_cpus) {
+		u32 *cid;
+
+		cpu = preferred_cpus[i];
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		cid = bpf_map_lookup_elem(&cpu_to_cluster_map, (const u32 *)&cpu);
+		if (cid && *cid == cluster_id)
+			return true;
+	}
+	return false;
+}
+
+static s32 pick_rr_cluster(const struct task_struct *p)
+{
+	u32 start, cid;
+	u32 i;
+
+	if (nr_clusters == 0)
+		return -1;
+
+	start = __sync_fetch_and_add(&rr_next_cluster, 1);
+	start %= nr_clusters;
+
+	/* Probe clusters in round-robin order until we find one that intersects p->cpus_ptr. */
+	bpf_for(i, 0, nr_clusters) {
+		cid = start + i;
+		if (cid >= nr_clusters)
+			cid -= nr_clusters;
+		if (cluster_has_allowed_cpu(p, cid))
+			return (s32)cid;
+	}
+	return -1;
+}
+
 /* Pick an idle CPU in the given cluster using cpu_to_cluster_map (no pre-filled cpumask in init). */
 static s32 pick_idle_cpu_in_cluster(struct task_struct *p, s32 prev_cpu, u32 cluster_id)
 {
@@ -443,7 +488,7 @@ s32 BPF_STRUCT_OPS(cluster_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 		return prev_cpu;
 	}
 
-	best_cluster = find_least_loaded_cluster(p);
+	best_cluster = pick_rr_cluster(p);
 	if (best_cluster >= 0) {
 		u32 cid = (u32)best_cluster;
 		u32 *pend_ptr = bpf_map_lookup_elem(&cluster_pending_map, &cid);
