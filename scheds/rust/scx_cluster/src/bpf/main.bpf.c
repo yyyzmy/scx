@@ -282,24 +282,28 @@ static bool cluster_has_allowed_cpu(const struct task_struct *p, u32 cluster_id)
 	return false;
 }
 
+/* Assign clusters strictly by task order: this task -> cluster (rr_next % nr_clusters); only try another if that cluster has no allowed CPU. */
 static s32 pick_rr_cluster(const struct task_struct *p)
 {
-	u32 start, cid;
-	u32 i;
+	u32 cid, i;
 
 	if (nr_clusters == 0)
 		return -1;
 
-	start = __sync_fetch_and_add(&rr_next_cluster, 1);
-	start %= nr_clusters;
+	cid = __sync_fetch_and_add(&rr_next_cluster, 1);
+	cid %= nr_clusters;
 
-	/* Probe clusters in round-robin order until we find one that intersects p->cpus_ptr. */
-	bpf_for(i, 0, nr_clusters) {
-		cid = start + i;
-		if (cid >= nr_clusters)
-			cid -= nr_clusters;
-		if (cluster_has_allowed_cpu(p, cid))
-			return (s32)cid;
+	if (cluster_has_allowed_cpu(p, cid))
+		return (s32)cid;
+
+	/* Assigned cluster not in p->cpus_ptr; probe remaining clusters in order. */
+	bpf_for(i, 1, nr_clusters) {
+		u32 next = cid + i;
+
+		if (next >= nr_clusters)
+			next -= nr_clusters;
+		if (cluster_has_allowed_cpu(p, next))
+			return (s32)next;
 	}
 	return -1;
 }
