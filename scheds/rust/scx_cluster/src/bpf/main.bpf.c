@@ -579,9 +579,21 @@ void BPF_STRUCT_OPS(cluster_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	if (task_should_migrate(p, enq_flags)) {
-		s32 cpu = is_pcpu_task(p) ?
-			(scx_bpf_test_and_clear_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY) :
-			pick_idle_cpu(p, prev_cpu, -1, 0, true);
+		s32 cpu = -EBUSY;
+		s32 best_cluster = pick_rr_cluster(p);
+
+		if (best_cluster >= 0) {
+			u32 cid = (u32)best_cluster;
+			u32 *pend_ptr = bpf_map_lookup_elem(&cluster_pending_map, &cid);
+
+			if (pend_ptr)
+				__sync_fetch_and_add(pend_ptr, 1);
+			cpu = pick_idle_cpu_in_cluster(p, prev_cpu, cid);
+			if (pend_ptr)
+				__sync_fetch_and_sub(pend_ptr, 1);
+		}
+		if (cpu < 0)
+			cpu = pick_idle_cpu(p, prev_cpu, -1, 0, true);
 		if (cpu >= 0) {
 			scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu),
 						 task_slice(p, cpu), task_dl(p, cpu, tctx), enq_flags);
