@@ -15,6 +15,7 @@ UEI_DEFINE(uei);
 
 static u64 nr_cpu_ids;
 static u32 nr_groups;
+static volatile u32 rr_next_group;
 
 /*
  * Built-in DSQs such as SCX_DSQ_GLOBAL cannot be used as priority queues
@@ -122,30 +123,35 @@ static bool group_has_allowed_cpu(struct task_struct *p, u32 g)
 	return false;
 }
 
-/* Return group with minimal load that has at least one allowed CPU, or -1. */
-static s32 pick_least_loaded_group(struct task_struct *p)
+/* Strict round-robin group assignment; probe forward only if not allowed. */
+static s32 pick_rr_group(struct task_struct *p)
 {
-	u32 g;
-	u32 best_load = (u32)-1;
-	s32 best_gid = -1;
+	u32 start;
+	u32 i;
 
-	for (g = 0; g < nr_groups; g++) {
-		u32 key = g;
-		u32 *load = bpf_map_lookup_elem(&group_load, &key);
+	if (nr_groups == 0)
+		return -1;
 
-		if (!load)
-			continue;
+	start = __sync_fetch_and_add(&rr_next_group, 1);
+	start %= nr_groups;
 
-		/* Skip groups without any allowed CPU for this task */
-		if (!group_has_allowed_cpu(p, g))
-			continue;
+	if (group_has_allowed_cpu(p, start))
+		return (s32)start;
 
-		if (*load < best_load) {
-			best_load = *load;
-			best_gid = (s32)g;
-		}
+	/* Probe up to nr_groups in order, bounded by MAX_GROUPS for verifier friendliness. */
+	bpf_for(i, 1, MAX_GROUPS) {
+		u32 next;
+
+		if (i >= nr_groups)
+			break;
+		next = start + i;
+		if (next >= nr_groups)
+			next -= nr_groups;
+		if (group_has_allowed_cpu(p, next))
+			return (s32)next;
 	}
-	return best_gid;
+
+	return -1;
 }
 
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -180,7 +186,7 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 	/* 3) Otherwise, pick CPU from least-loaded group with an allowed CPU */
 	{
-		s32 best_gid = pick_least_loaded_group(p);
+		s32 best_gid = pick_rr_group(p);
 
 		if (best_gid >= 0) {
 			cpu = pick_idle_cpu_in_group(p, best_gid);
