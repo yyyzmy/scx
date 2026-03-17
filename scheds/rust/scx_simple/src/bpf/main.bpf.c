@@ -168,15 +168,63 @@ static s32 pick_group_for_task(struct task_struct *p, s32 prev_cpu)
 	return pick_rr_group(p);
 }
 
+static s32 pick_best_cpu_in_group(struct task_struct *p, s32 prev_cpu, s32 group_id)
+{
+	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
+	u32 base, i, cpu;
+
+	if (group_id < 0)
+		return -1;
+
+	/* Prefer prev_cpu if it belongs to this group and is idle. */
+	if (prev_cpu >= 0 &&
+	    ((s32)(((u32)prev_cpu) / GROUP_SIZE) == group_id) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		return prev_cpu;
+
+	/* Otherwise, pick the first idle CPU in the group. */
+	base = ((u32)group_id) * GROUP_SIZE;
+	bpf_for(i, 0, GROUP_SIZE) {
+		cpu = base + i;
+		if (cpu >= (u32)max)
+			break;
+		if (!bpf_cpumask_test_cpu((s32)cpu, p->cpus_ptr))
+			continue;
+		if (scx_bpf_test_and_clear_cpu_idle((s32)cpu))
+			return (s32)cpu;
+	}
+
+	return -1;
+}
+
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	/*
-	 * Do not dispatch from select_cpu. We want all placement and balancing
-	 * to happen from enqueue() + per-group DSQs.
-	 */
-	bool is_idle = false;
+	s32 cpu;
+	s32 gid;
 
-	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	/* Ensure prev_cpu is usable; otherwise pick first allowed CPU as a hint. */
+	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		prev_cpu = bpf_cpumask_first(p->cpus_ptr);
+
+	/* 1) Round-robin pick a scheduling domain (group). */
+	gid = pick_rr_group(p);
+
+	/* 2) Pick the best CPU within the selected group. */
+	if (gid >= 0) {
+		cpu = pick_best_cpu_in_group(p, prev_cpu, gid);
+		if (cpu >= 0) {
+			stat_inc(0); /* count local queueing (direct dispatch) */
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+			return cpu;
+		}
+	}
+
+	/* 3) Fallback: let the kernel pick a CPU, without direct dispatch. */
+	{
+		bool is_idle = false;
+		return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	}
 }
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
