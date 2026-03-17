@@ -84,50 +84,60 @@ static void dec_group_load_for_cpu(s32 cpu)
 /* Return first idle CPU in given group intersecting p->cpus_ptr, or -1. */
 static s32 pick_idle_cpu_in_group(struct task_struct *p, s32 group_id)
 {
-	s32 cpu;
+	u32 i;
+	u32 base, cpu;
 	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
 
 	if (group_id < 0)
 		return -1;
 
-	for (cpu = 0; cpu < (s32)max; cpu++) {
-		if ((s32)(((u32)cpu) / GROUP_SIZE) != group_id)
+	base = ((u32)group_id) * GROUP_SIZE;
+
+	/* Only scan CPUs in this group (max GROUP_SIZE iterations). */
+	bpf_for(i, 0, GROUP_SIZE) {
+		cpu = base + i;
+		if (cpu >= (u32)max)
+			break;
+		if (!bpf_cpumask_test_cpu((s32)cpu, p->cpus_ptr))
 			continue;
-		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-			continue;
-		if (scx_bpf_test_and_clear_cpu_idle(cpu))
-			return cpu;
+		if (scx_bpf_test_and_clear_cpu_idle((s32)cpu))
+			return (s32)cpu;
 	}
 	return -1;
+}
+
+static bool group_has_allowed_cpu(struct task_struct *p, u32 g)
+{
+	u32 i;
+	u32 cpu = g * GROUP_SIZE;
+	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
+
+	bpf_for(i, 0, GROUP_SIZE) {
+		u32 c = cpu + i;
+		if (c >= (u32)max)
+			break;
+		if (bpf_cpumask_test_cpu((s32)c, p->cpus_ptr))
+			return true;
+	}
+	return false;
 }
 
 /* Return group with minimal load that has at least one allowed CPU, or -1. */
 static s32 pick_least_loaded_group(struct task_struct *p)
 {
 	u32 g;
-	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
 	u32 best_load = (u32)-1;
 	s32 best_gid = -1;
 
 	for (g = 0; g < nr_groups; g++) {
 		u32 key = g;
 		u32 *load = bpf_map_lookup_elem(&group_load, &key);
-		s32 cpu;
-		bool has_allowed = false;
 
 		if (!load)
 			continue;
 
 		/* Skip groups without any allowed CPU for this task */
-		for (cpu = 0; cpu < (s32)max; cpu++) {
-			if (((u32)cpu) / GROUP_SIZE != g)
-				continue;
-			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-				continue;
-			has_allowed = true;
-			break;
-		}
-		if (!has_allowed)
+		if (!group_has_allowed_cpu(p, g))
 			continue;
 
 		if (*load < best_load) {
