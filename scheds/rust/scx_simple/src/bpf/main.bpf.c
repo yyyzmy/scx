@@ -26,6 +26,10 @@ static volatile u32 rr_next_group;
  */
 #define SHARED_DSQ 0
 
+/* Per-group DSQ IDs start from 1 (0 is SHARED_DSQ). */
+#define GROUP_DSQ_BASE	1
+static inline u64 group_dsq_id(u32 gid) { return (u64)GROUP_DSQ_BASE + gid; }
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
@@ -154,6 +158,16 @@ static s32 pick_rr_group(struct task_struct *p)
 	return -1;
 }
 
+/* Prefer previous CPU's group if allowed, otherwise round-robin. */
+static s32 pick_group_for_task(struct task_struct *p, s32 prev_cpu)
+{
+	s32 gid = get_group_id(prev_cpu);
+
+	if (gid >= 0 && group_has_allowed_cpu(p, (u32)gid))
+		return gid;
+	return pick_rr_group(p);
+}
+
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	s32 cpu;
@@ -213,10 +227,14 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	s32 prev_cpu = scx_bpf_task_cpu(p);
+	s32 gid = pick_group_for_task(p, prev_cpu);
+	u64 dsq = (gid >= 0) ? group_dsq_id((u32)gid) : (u64)SHARED_DSQ;
+
 	stat_inc(1);	/* count global queueing */
 
 	if (fifo_sched) {
-		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+		scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
 	} else {
 		u64 vtime = p->scx.dsq_vtime;
 
@@ -227,13 +245,20 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
 			vtime = vtime_now - SCX_SLICE_DFL;
 
-		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
+		scx_bpf_dsq_insert_vtime(p, dsq, SCX_SLICE_DFL, vtime,
 					 enq_flags);
 	}
 }
 
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
 {
+	s32 gid = get_group_id(cpu);
+
+	/* Prefer tasks queued to this CPU's group DSQ. */
+	if (gid >= 0)
+		scx_bpf_dsq_move_to_local(group_dsq_id((u32)gid));
+
+	/* Fallback: consume from shared DSQ if any. */
 	scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 
@@ -283,6 +308,7 @@ void BPF_STRUCT_OPS(simple_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
 {
 	s32 err;
+	u32 g;
 
 	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
 	if (err)
@@ -294,6 +320,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
 	nr_groups = (nr_cpu_ids + GROUP_SIZE - 1) / GROUP_SIZE;
 	if (nr_groups > MAX_GROUPS)
 		nr_groups = MAX_GROUPS;
+
+	/* Create per-group DSQs. */
+	bpf_for(g, 0, MAX_GROUPS) {
+		if (g >= nr_groups)
+			break;
+		err = scx_bpf_create_dsq(group_dsq_id(g), -1);
+		if (err)
+			return err;
+	}
 
 	return 0;
 }
