@@ -1,10 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * scx_simple - a simple sched_ext scheduler.
- *
- * This is a direct port of scheds/c/scx_simple.bpf.c to the common
- * "src/bpf/main.bpf.c" layout used by Rust schedulers.
- */
 #include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
@@ -13,6 +7,13 @@ const volatile bool fifo_sched;
 
 static u64 vtime_now;
 UEI_DEFINE(uei);
+
+/* Grouping: 8 CPUs per group for balancing */
+#define MAX_CPUS	1024
+#define GROUP_SIZE	8
+#define MAX_GROUPS	(MAX_CPUS / GROUP_SIZE)
+
+static u64 nr_cpu_ids;
 
 /*
  * Built-in DSQs such as SCX_DSQ_GLOBAL cannot be used as priority queues
@@ -30,6 +31,22 @@ struct {
 	__uint(max_entries, 2);			/* [local, global] */
 } stats SEC(".maps");
 
+/* cpu_id -> group_id (cpu / GROUP_SIZE) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32));
+	__uint(max_entries, MAX_CPUS);
+} cpu_to_group SEC(".maps");
+
+/* current running tasks per group */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32));
+	__uint(max_entries, MAX_GROUPS);
+} group_load SEC(".maps");
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
@@ -37,18 +54,170 @@ static void stat_inc(u32 idx)
 		(*cnt_p)++;
 }
 
+static s32 get_group_id(s32 cpu)
+{
+	u32 key = (u32)cpu;
+	u32 *gid;
+
+	if (cpu < 0 || cpu >= MAX_CPUS)
+		return -1;
+
+	gid = bpf_map_lookup_elem(&cpu_to_group, &key);
+	if (!gid)
+		return -1;
+	return (s32)(*gid);
+}
+
+static void inc_group_load_for_cpu(s32 cpu)
+{
+	s32 gid = get_group_id(cpu);
+	u32 key = (u32)gid;
+	u32 *val;
+
+	if (gid < 0 || gid >= MAX_GROUPS)
+		return;
+	val = bpf_map_lookup_elem(&group_load, &key);
+	if (val)
+		__sync_fetch_and_add(val, 1);
+}
+
+static void dec_group_load_for_cpu(s32 cpu)
+{
+	s32 gid = get_group_id(cpu);
+	u32 key = (u32)gid;
+	u32 *val;
+
+	if (gid < 0 || gid >= MAX_GROUPS)
+		return;
+	val = bpf_map_lookup_elem(&group_load, &key);
+	if (val)
+		__sync_fetch_and_sub(val, 1);
+}
+
+/* Return first idle CPU in given group intersecting p->cpus_ptr, or -1. */
+static s32 pick_idle_cpu_in_group(struct task_struct *p, s32 group_id)
+{
+	s32 cpu;
+	u32 g;
+	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
+
+	if (group_id < 0)
+		return -1;
+
+	for (cpu = 0; cpu < (s32)max; cpu++) {
+		u32 key = (u32)cpu;
+		u32 *gid = bpf_map_lookup_elem(&cpu_to_group, &key);
+
+		if (!gid)
+			continue;
+		g = *gid;
+		if ((s32)g != group_id)
+			continue;
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		if (scx_bpf_test_and_clear_cpu_idle(cpu))
+			return cpu;
+	}
+	return -1;
+}
+
+/* Return group with minimal load that has at least one allowed CPU, or -1. */
+static s32 pick_least_loaded_group(struct task_struct *p)
+{
+	u32 g;
+	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
+	u32 best_load = (u32)-1;
+	s32 best_gid = -1;
+
+	for (g = 0; g < MAX_GROUPS; g++) {
+		u32 key = g;
+		u32 *load = bpf_map_lookup_elem(&group_load, &key);
+		s32 cpu;
+		bool has_allowed = false;
+
+		if (!load)
+			continue;
+
+		/* Skip groups without any allowed CPU for this task */
+		for (cpu = 0; cpu < (s32)max; cpu++) {
+			u32 cpu_key = (u32)cpu;
+			u32 *gid = bpf_map_lookup_elem(&cpu_to_group, &cpu_key);
+
+			if (!gid)
+				continue;
+			if (*gid != g)
+				continue;
+			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+				continue;
+			has_allowed = true;
+			break;
+		}
+		if (!has_allowed)
+			continue;
+
+		if (*load < best_load) {
+			best_load = *load;
+			best_gid = (s32)g;
+		}
+	}
+	return best_gid;
+}
+
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	bool is_idle = false;
 	s32 cpu;
+	s32 last_cpu = prev_cpu;
 
-	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle) {
-		stat_inc(0);	/* count local queueing */
+	/* Ensure last_cpu is usable; otherwise pick first allowed CPU */
+	if (!bpf_cpumask_test_cpu(last_cpu, p->cpus_ptr))
+		last_cpu = bpf_cpumask_first(p->cpus_ptr);
+
+	/* 1) Strong stickiness: prefer previous CPU if idle */
+	if (last_cpu >= 0 && scx_bpf_test_and_clear_cpu_idle(last_cpu)) {
+		stat_inc(0);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		return last_cpu;
 	}
 
-	return cpu;
+	/* 2) Prefer same group as previous CPU */
+	{
+		s32 gid = get_group_id(last_cpu);
+
+		if (gid >= 0) {
+			cpu = pick_idle_cpu_in_group(p, gid);
+			if (cpu >= 0) {
+				stat_inc(0);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+				return cpu;
+			}
+		}
+	}
+
+	/* 3) Otherwise, pick CPU from least-loaded group with an allowed CPU */
+	{
+		s32 best_gid = pick_least_loaded_group(p);
+
+		if (best_gid >= 0) {
+			cpu = pick_idle_cpu_in_group(p, best_gid);
+			if (cpu >= 0) {
+				stat_inc(0);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+				return cpu;
+			}
+		}
+	}
+
+	/* 4) Fallback to default kernel helper */
+	{
+		bool is_idle = false;
+
+		cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+		if (is_idle) {
+			stat_inc(0);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		}
+		return cpu;
+	}
 }
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
@@ -82,6 +251,9 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 	if (fifo_sched)
 		return;
 
+	/* Track per-group running load for balancing. */
+	inc_group_load_for_cpu(scx_bpf_task_cpu(p));
+
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
 	 * test and update can be performed concurrently from multiple CPUs and
@@ -96,6 +268,9 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
 {
 	if (fifo_sched)
 		return;
+
+	/* Update per-group running load. */
+	dec_group_load_for_cpu(scx_bpf_task_cpu(p));
 
 	/*
 	 * Scale the execution time by the inverse of the weight and charge.
@@ -116,7 +291,28 @@ void BPF_STRUCT_OPS(simple_enable, struct task_struct *p)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
 {
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+	s32 err;
+	s32 cpu;
+	u64 max;
+
+	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (err)
+		return err;
+
+	nr_cpu_ids = scx_bpf_nr_cpu_ids();
+	max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
+
+	/* Initialize cpu_to_group: group = cpu / GROUP_SIZE */
+	for (cpu = 0; cpu < (s32)max; cpu++) {
+		u32 cpu_key = (u32)cpu;
+		u32 gid = (u32)(cpu / GROUP_SIZE);
+
+		if (gid >= MAX_GROUPS)
+			gid = MAX_GROUPS - 1;
+		bpf_map_update_elem(&cpu_to_group, &cpu_key, &gid, BPF_ANY);
+	}
+
+	return 0;
 }
 
 void BPF_STRUCT_OPS(simple_exit, struct scx_exit_info *ei)
