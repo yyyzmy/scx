@@ -14,6 +14,7 @@ UEI_DEFINE(uei);
 #define MAX_GROUPS	(MAX_CPUS / GROUP_SIZE)
 
 static u64 nr_cpu_ids;
+static u32 nr_groups;
 
 /*
  * Built-in DSQs such as SCX_DSQ_GLOBAL cannot be used as priority queues
@@ -30,14 +31,6 @@ struct {
 	__uint(value_size, sizeof(u64));
 	__uint(max_entries, 2);			/* [local, global] */
 } stats SEC(".maps");
-
-/* cpu_id -> group_id (cpu / GROUP_SIZE) */
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(key_size, sizeof(u32));
-	__uint(value_size, sizeof(u32));
-	__uint(max_entries, MAX_CPUS);
-} cpu_to_group SEC(".maps");
 
 /* current running tasks per group */
 struct {
@@ -56,16 +49,9 @@ static void stat_inc(u32 idx)
 
 static s32 get_group_id(s32 cpu)
 {
-	u32 key = (u32)cpu;
-	u32 *gid;
-
 	if (cpu < 0 || cpu >= MAX_CPUS)
 		return -1;
-
-	gid = bpf_map_lookup_elem(&cpu_to_group, &key);
-	if (!gid)
-		return -1;
-	return (s32)(*gid);
+	return cpu / GROUP_SIZE;
 }
 
 static void inc_group_load_for_cpu(s32 cpu)
@@ -98,20 +84,13 @@ static void dec_group_load_for_cpu(s32 cpu)
 static s32 pick_idle_cpu_in_group(struct task_struct *p, s32 group_id)
 {
 	s32 cpu;
-	u32 g;
 	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
 
 	if (group_id < 0)
 		return -1;
 
 	for (cpu = 0; cpu < (s32)max; cpu++) {
-		u32 key = (u32)cpu;
-		u32 *gid = bpf_map_lookup_elem(&cpu_to_group, &key);
-
-		if (!gid)
-			continue;
-		g = *gid;
-		if ((s32)g != group_id)
+		if (cpu / GROUP_SIZE != group_id)
 			continue;
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 			continue;
@@ -129,7 +108,7 @@ static s32 pick_least_loaded_group(struct task_struct *p)
 	u32 best_load = (u32)-1;
 	s32 best_gid = -1;
 
-	for (g = 0; g < MAX_GROUPS; g++) {
+	for (g = 0; g < nr_groups; g++) {
 		u32 key = g;
 		u32 *load = bpf_map_lookup_elem(&group_load, &key);
 		s32 cpu;
@@ -140,12 +119,7 @@ static s32 pick_least_loaded_group(struct task_struct *p)
 
 		/* Skip groups without any allowed CPU for this task */
 		for (cpu = 0; cpu < (s32)max; cpu++) {
-			u32 cpu_key = (u32)cpu;
-			u32 *gid = bpf_map_lookup_elem(&cpu_to_group, &cpu_key);
-
-			if (!gid)
-				continue;
-			if (*gid != g)
+			if ((u32)(cpu / GROUP_SIZE) != g)
 				continue;
 			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 				continue;
@@ -292,25 +266,17 @@ void BPF_STRUCT_OPS(simple_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
 {
 	s32 err;
-	s32 cpu;
-	u64 max;
 
 	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
 	if (err)
 		return err;
 
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
-	max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
-
-	/* Initialize cpu_to_group: group = cpu / GROUP_SIZE */
-	for (cpu = 0; cpu < (s32)max; cpu++) {
-		u32 cpu_key = (u32)cpu;
-		u32 gid = (u32)(cpu / GROUP_SIZE);
-
-		if (gid >= MAX_GROUPS)
-			gid = MAX_GROUPS - 1;
-		bpf_map_update_elem(&cpu_to_group, &cpu_key, &gid, BPF_ANY);
-	}
+	if (nr_cpu_ids > MAX_CPUS)
+		nr_cpu_ids = MAX_CPUS;
+	nr_groups = (nr_cpu_ids + GROUP_SIZE - 1) / GROUP_SIZE;
+	if (nr_groups > MAX_GROUPS)
+		nr_groups = MAX_GROUPS;
 
 	return 0;
 }
