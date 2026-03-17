@@ -170,59 +170,13 @@ static s32 pick_group_for_task(struct task_struct *p, s32 prev_cpu)
 
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	s32 cpu;
-	s32 last_cpu = prev_cpu;
+	/*
+	 * Do not dispatch from select_cpu. We want all placement and balancing
+	 * to happen from enqueue() + per-group DSQs.
+	 */
+	bool is_idle = false;
 
-	/* Ensure last_cpu is usable; otherwise pick first allowed CPU */
-	if (!bpf_cpumask_test_cpu(last_cpu, p->cpus_ptr))
-		last_cpu = bpf_cpumask_first(p->cpus_ptr);
-
-	/* 1) Strong stickiness: prefer previous CPU if idle */
-	if (last_cpu >= 0 && scx_bpf_test_and_clear_cpu_idle(last_cpu)) {
-		stat_inc(0);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-		return last_cpu;
-	}
-
-	/* 2) Prefer same group as previous CPU */
-	{
-		s32 gid = get_group_id(last_cpu);
-
-		if (gid >= 0) {
-			cpu = pick_idle_cpu_in_group(p, gid);
-			if (cpu >= 0) {
-				stat_inc(0);
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-				return cpu;
-			}
-		}
-	}
-
-	/* 3) Otherwise, pick CPU from least-loaded group with an allowed CPU */
-	{
-		s32 best_gid = pick_rr_group(p);
-
-		if (best_gid >= 0) {
-			cpu = pick_idle_cpu_in_group(p, best_gid);
-			if (cpu >= 0) {
-				stat_inc(0);
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-				return cpu;
-			}
-		}
-	}
-
-	/* 4) Fallback to default kernel helper */
-	{
-		bool is_idle = false;
-
-		cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-		if (is_idle) {
-			stat_inc(0);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-		}
-		return cpu;
-	}
+	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
