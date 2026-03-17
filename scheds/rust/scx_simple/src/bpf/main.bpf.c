@@ -51,7 +51,8 @@ static s32 get_group_id(s32 cpu)
 {
 	if (cpu < 0 || cpu >= MAX_CPUS)
 		return -1;
-	return cpu / GROUP_SIZE;
+	/* clang bpf backend doesn't support signed div; use unsigned. */
+	return (s32)(((u32)cpu) / GROUP_SIZE);
 }
 
 static void inc_group_load_for_cpu(s32 cpu)
@@ -90,7 +91,7 @@ static s32 pick_idle_cpu_in_group(struct task_struct *p, s32 group_id)
 		return -1;
 
 	for (cpu = 0; cpu < (s32)max; cpu++) {
-		if (cpu / GROUP_SIZE != group_id)
+		if ((s32)(((u32)cpu) / GROUP_SIZE) != group_id)
 			continue;
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 			continue;
@@ -119,7 +120,7 @@ static s32 pick_least_loaded_group(struct task_struct *p)
 
 		/* Skip groups without any allowed CPU for this task */
 		for (cpu = 0; cpu < (s32)max; cpu++) {
-			if ((u32)(cpu / GROUP_SIZE) != g)
+			if (((u32)cpu) / GROUP_SIZE != g)
 				continue;
 			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 				continue;
