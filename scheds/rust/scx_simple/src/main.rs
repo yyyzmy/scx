@@ -123,8 +123,12 @@ fn monitor_redis_groups() -> Result<()> {
         for t_res in tasks {
             let Ok(t) = t_res else { continue };
             let Ok(tstat) = t.stat() else { continue };
-            let tid = tstat.tid;
-            let cpu = tstat.processor as usize;
+            let tid = tstat.pid;
+            let Some(cpu_i32) = tstat.processor else { continue };
+            if cpu_i32 < 0 {
+                continue;
+            }
+            let cpu: usize = (cpu_i32 as u32) as usize;
             let group = cpu / GROUP_SIZE;
             println!(
                 "[redis pid={pid} tid={tid}] cpu={cpu} group={group}"
