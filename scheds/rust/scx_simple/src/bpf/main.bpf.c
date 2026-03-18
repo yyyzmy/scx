@@ -86,8 +86,8 @@ static void dec_group_load_for_cpu(s32 cpu)
 		__sync_fetch_and_sub(val, 1);
 }
 
-/* Only balance tasks whose comm starts with \"stress-ng\". */
-static bool is_stress_ng_task(const struct task_struct *p)
+/* Only balance tasks whose comm starts with \"redis-server\". */
+static bool is_redis_task(const struct task_struct *p)
 {
 	char comm[TASK_COMM_LEN];
 	int i;
@@ -95,8 +95,8 @@ static bool is_stress_ng_task(const struct task_struct *p)
 	if (bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm) <= 0)
 		return false;
 
-	/* Match prefix \"stress-ng\" (9 chars including '-') */
-	const char pat[] = "stress-ng";
+	/* Match prefix \"redis-server\" */
+	const char pat[] = "redis-server";
 
 	for (i = 0; i < (int)sizeof(pat) - 1; i++) {
 		if (comm[i] != pat[i])
@@ -222,8 +222,8 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	s32 cpu;
 	s32 gid;
 
-	/* Non stress-ng tasks: don't interfere, let kernel pick. */
-	if (!is_stress_ng_task(p)) {
+	/* Non redis-server tasks: don't interfere, let kernel pick. */
+	if (!is_redis_task(p)) {
 		bool is_idle = false;
 		return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	}
@@ -256,8 +256,8 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	stat_inc(1);	/* count global queueing */
 
-	/* Non stress-ng tasks: always use shared DSQ. */
-	if (!is_stress_ng_task(p)) {
+	/* Non redis-server tasks: always use shared DSQ. */
+	if (!is_redis_task(p)) {
 		if (fifo_sched) {
 			scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 		} else {
