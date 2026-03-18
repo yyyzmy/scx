@@ -86,6 +86,25 @@ static void dec_group_load_for_cpu(s32 cpu)
 		__sync_fetch_and_sub(val, 1);
 }
 
+/* Only balance tasks whose comm starts with \"stress-ng\". */
+static bool is_stress_ng_task(const struct task_struct *p)
+{
+	char comm[TASK_COMM_LEN];
+	int i;
+
+	if (bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm) <= 0)
+		return false;
+
+	/* Match prefix \"stress-ng\" (9 chars including '-') */
+	const char pat[] = "stress-ng";
+
+	for (i = 0; i < (int)sizeof(pat) - 1; i++) {
+		if (comm[i] != pat[i])
+			return false;
+	}
+	return true;
+}
+
 /* Return first idle CPU in given group intersecting p->cpus_ptr, or -1. */
 static s32 pick_idle_cpu_in_group(struct task_struct *p, s32 group_id)
 {
@@ -203,6 +222,12 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	s32 cpu;
 	s32 gid;
 
+	/* Non stress-ng tasks: don't interfere, let kernel pick. */
+	if (!is_stress_ng_task(p)) {
+		bool is_idle = false;
+		return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	}
+
 	/* Ensure prev_cpu is usable; otherwise pick first allowed CPU as a hint. */
 	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		prev_cpu = bpf_cpumask_first(p->cpus_ptr);
@@ -229,11 +254,28 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	s32 prev_cpu = scx_bpf_task_cpu(p);
-	s32 gid = pick_group_for_task(p, prev_cpu);
-	u64 dsq = (gid >= 0) ? group_dsq_id((u32)gid) : (u64)SHARED_DSQ;
-
 	stat_inc(1);	/* count global queueing */
+
+	/* Non stress-ng tasks: always use shared DSQ. */
+	if (!is_stress_ng_task(p)) {
+		if (fifo_sched) {
+			scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+		} else {
+			u64 vtime = p->scx.dsq_vtime;
+
+			if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
+				vtime = vtime_now - SCX_SLICE_DFL;
+			scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
+						 enq_flags);
+		}
+		return;
+	}
+
+	/* stress-ng tasks: use per-group DSQs with balancing. */
+	{
+		s32 prev_cpu = scx_bpf_task_cpu(p);
+		s32 gid = pick_group_for_task(p, prev_cpu);
+		u64 dsq = (gid >= 0) ? group_dsq_id((u32)gid) : (u64)SHARED_DSQ;
 
 	if (fifo_sched) {
 		scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
@@ -247,8 +289,11 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
 			vtime = vtime_now - SCX_SLICE_DFL;
 
-		scx_bpf_dsq_insert_vtime(p, dsq, SCX_SLICE_DFL, vtime,
-					 enq_flags);
+			if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
+				vtime = vtime_now - SCX_SLICE_DFL;
+			scx_bpf_dsq_insert_vtime(p, dsq, SCX_SLICE_DFL, vtime,
+						 enq_flags);
+		}
 	}
 }
 
