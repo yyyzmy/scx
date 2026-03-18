@@ -45,6 +45,14 @@ struct {
 	__uint(max_entries, MAX_GROUPS);
 } group_load SEC(".maps");
 
+/* Per-process (tgid) group assignment for redis-server. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(key_size, sizeof(u32));   /* tgid */
+	__uint(value_size, sizeof(u32)); /* group id */
+	__uint(max_entries, 16384);
+} proc_group SEC(".maps");
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
@@ -177,14 +185,42 @@ static s32 pick_rr_group(struct task_struct *p)
 	return -1;
 }
 
-/* Prefer previous CPU's group if allowed, otherwise round-robin. */
+static inline u32 task_tgid(const struct task_struct *p)
+{
+	/* bpf_core_read() is available via scx/common.bpf.h */
+	return (u32)BPF_CORE_READ(p, tgid);
+}
+
+/* For redis-server: same process (tgid) stays in one group; different processes get RR groups. */
 static s32 pick_group_for_task(struct task_struct *p, s32 prev_cpu)
 {
-	s32 gid = get_group_id(prev_cpu);
+	u32 tgid = task_tgid(p);
+	u32 *gidp;
+	s32 gid;
 
-	if (gid >= 0 && group_has_allowed_cpu(p, (u32)gid))
+	/* 1) If this tgid already has an assigned group and it's allowed, use it. */
+	gidp = bpf_map_lookup_elem(&proc_group, &tgid);
+	if (gidp) {
+		gid = (s32)*gidp;
+		if (gid >= 0 && (u32)gid < nr_groups && group_has_allowed_cpu(p, (u32)gid))
+			return gid;
+	}
+
+	/* 2) Otherwise prefer prev_cpu's group if allowed. */
+	gid = get_group_id(prev_cpu);
+	if (gid >= 0 && (u32)gid < nr_groups && group_has_allowed_cpu(p, (u32)gid)) {
+		u32 ugid = (u32)gid;
+		bpf_map_update_elem(&proc_group, &tgid, &ugid, BPF_ANY);
 		return gid;
-	return pick_rr_group(p);
+	}
+
+	/* 3) Assign a group by strict RR (probe forward only if not allowed). */
+	gid = pick_rr_group(p);
+	if (gid >= 0) {
+		u32 ugid = (u32)gid;
+		bpf_map_update_elem(&proc_group, &tgid, &ugid, BPF_ANY);
+	}
+	return gid;
 }
 
 static s32 pick_best_cpu_in_group(struct task_struct *p, s32 prev_cpu, s32 group_id)
@@ -232,8 +268,8 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		prev_cpu = bpf_cpumask_first(p->cpus_ptr);
 
-	/* 1) Round-robin pick a scheduling domain (group). */
-	gid = pick_rr_group(p);
+	/* 1) Pick a scheduling domain (group) with per-process affinity. */
+	gid = pick_group_for_task(p, prev_cpu);
 
 	/* 2) Pick the best CPU within the selected group. */
 	if (gid >= 0) {
@@ -271,7 +307,7 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-	/* stress-ng tasks: use per-group DSQs with balancing. */
+	/* redis-server tasks: use per-group DSQs with balancing. */
 	{
 		s32 prev_cpu = scx_bpf_task_cpu(p);
 		s32 gid = pick_group_for_task(p, prev_cpu);
@@ -314,8 +350,9 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 	if (fifo_sched)
 		return;
 
-	/* Track per-group running load for balancing. */
-	inc_group_load_for_cpu(scx_bpf_task_cpu(p));
+	/* Track per-group running load (redis-server only). */
+	if (is_redis_task(p))
+		inc_group_load_for_cpu(scx_bpf_task_cpu(p));
 
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
@@ -332,8 +369,9 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
 	if (fifo_sched)
 		return;
 
-	/* Update per-group running load. */
-	dec_group_load_for_cpu(scx_bpf_task_cpu(p));
+	/* Update per-group running load (redis-server only). */
+	if (is_redis_task(p))
+		dec_group_load_for_cpu(scx_bpf_task_cpu(p));
 
 	/*
 	 * Scale the execution time by the inverse of the weight and charge.
