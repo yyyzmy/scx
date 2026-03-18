@@ -114,30 +114,6 @@ static bool is_redis_task(const struct task_struct *p)
 }
 
 /* Return first idle CPU in given group intersecting p->cpus_ptr, or -1. */
-static s32 pick_idle_cpu_in_group(struct task_struct *p, s32 group_id)
-{
-	u32 i;
-	u32 base, cpu;
-	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
-
-	if (group_id < 0)
-		return -1;
-
-	base = ((u32)group_id) * GROUP_SIZE;
-
-	/* Only scan CPUs in this group (max GROUP_SIZE iterations). */
-	bpf_for(i, 0, GROUP_SIZE) {
-		cpu = base + i;
-		if (cpu >= (u32)max)
-			break;
-		if (!bpf_cpumask_test_cpu((s32)cpu, p->cpus_ptr))
-			continue;
-		if (scx_bpf_test_and_clear_cpu_idle((s32)cpu))
-			return (s32)cpu;
-	}
-	return -1;
-}
-
 static bool group_has_allowed_cpu(struct task_struct *p, u32 g)
 {
 	u32 i;
@@ -313,20 +289,18 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		s32 gid = pick_group_for_task(p, prev_cpu);
 		u64 dsq = (gid >= 0) ? group_dsq_id((u32)gid) : (u64)SHARED_DSQ;
 
-	if (fifo_sched) {
-		scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
-	} else {
-		u64 vtime = p->scx.dsq_vtime;
+		if (fifo_sched) {
+			scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
+		} else {
+			u64 vtime = p->scx.dsq_vtime;
 
-		/*
-		 * Limit the amount of budget that an idling task can accumulate
-		 * to one slice.
-		 */
-		if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
-			vtime = vtime_now - SCX_SLICE_DFL;
-
+			/*
+			 * Limit the amount of budget that an idling task can accumulate
+			 * to one slice.
+			 */
 			if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
 				vtime = vtime_now - SCX_SLICE_DFL;
+
 			scx_bpf_dsq_insert_vtime(p, dsq, SCX_SLICE_DFL, vtime,
 						 enq_flags);
 		}

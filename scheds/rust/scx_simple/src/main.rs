@@ -110,7 +110,8 @@ fn monitor_redis_groups() -> Result<()> {
     // CPUs-per-group must match GROUP_SIZE in BPF.
     const GROUP_SIZE: usize = 8;
 
-    for proc in all_processes()? {
+    for proc_res in all_processes()? {
+        let Ok(proc) = proc_res else { continue };
         let Ok(stat) = proc.stat() else { continue };
         if !stat.comm.starts_with("redis-server") {
             continue;
@@ -119,7 +120,8 @@ fn monitor_redis_groups() -> Result<()> {
 
         // Iterate threads of this redis-server.
         let Ok(tasks) = proc.tasks() else { continue };
-        for t in tasks {
+        for t_res in tasks {
+            let Ok(t) = t_res else { continue };
             let Ok(tstat) = t.stat() else { continue };
             let tid = tstat.tid;
             let cpu = tstat.processor as usize;
