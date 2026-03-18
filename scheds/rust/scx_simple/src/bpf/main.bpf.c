@@ -229,6 +229,13 @@ static s32 pick_best_cpu_in_group(struct task_struct *p, s32 prev_cpu, s32 group
 	return -1;
 }
 
+/* Like pandemonium: if we found a target idle CPU, actively kick it. */
+static __always_inline void kick_target_cpu(s32 cpu)
+{
+	if (cpu >= 0 && (u32)cpu < nr_cpu_ids)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+}
+
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	s32 cpu;
@@ -253,6 +260,7 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 		if (cpu >= 0) {
 			stat_inc(0); /* count local queueing (direct dispatch) */
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+			kick_target_cpu(cpu);
 			return cpu;
 		}
 	}
@@ -288,6 +296,14 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		s32 prev_cpu = scx_bpf_task_cpu(p);
 		s32 gid = pick_group_for_task(p, prev_cpu);
 		u64 dsq = (gid >= 0) ? group_dsq_id((u32)gid) : (u64)SHARED_DSQ;
+		s32 cpu = -1;
+
+		/* Like pandemonium tier1: if possible, pick an idle CPU in our group and kick it. */
+		if (gid >= 0) {
+			cpu = pick_best_cpu_in_group(p, prev_cpu, gid);
+			if (cpu >= 0)
+				kick_target_cpu(cpu);
+		}
 
 		if (fifo_sched) {
 			scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
