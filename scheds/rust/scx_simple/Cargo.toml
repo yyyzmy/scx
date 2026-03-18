@@ -14,6 +14,7 @@ libbpf-rs = "=0.26.1"
 log = "0.4.17"
 simplelog = "0.12"
 scx_utils = { path = "../../../rust/scx_utils", version = "1.0.26" }
+procfs = "0.18"
 
 [build-dependencies]
 scx_cargo = { path = "../../../rust/scx_cargo", version = "1.0.27" }

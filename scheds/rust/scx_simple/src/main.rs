@@ -8,11 +8,13 @@ pub use bpf_skel::*;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
 use log::{debug, info};
+use procfs::process::all_processes;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -38,6 +40,10 @@ struct Opts {
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
+
+    /// Monitor redis-server threads and print their CPU and group (CPUs/8).
+    #[clap(long)]
+    monitor_redis: Option<f64>,
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
@@ -100,6 +106,33 @@ impl Drop for Scheduler<'_> {
     }
 }
 
+fn monitor_redis_groups() -> Result<()> {
+    // CPUs-per-group must match GROUP_SIZE in BPF.
+    const GROUP_SIZE: usize = 8;
+
+    for proc in all_processes()? {
+        let Ok(stat) = proc.stat() else { continue };
+        if !stat.comm.starts_with("redis-server") {
+            continue;
+        }
+        let pid = stat.pid;
+
+        // Iterate threads of this redis-server.
+        let Ok(tasks) = proc.tasks() else { continue };
+        for t in tasks {
+            let Ok(tstat) = t.stat() else { continue };
+            let tid = tstat.tid;
+            let cpu = tstat.processor as usize;
+            let group = cpu / GROUP_SIZE;
+            println!(
+                "[redis pid={pid} tid={tid}] cpu={cpu} group={group}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let opts = Opts::parse();
 
@@ -137,6 +170,23 @@ fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         shutdown_clone.store(true, Ordering::Relaxed);
     })?;
+
+    // Optional redis monitor thread.
+    if let Some(intv) = opts.monitor_redis {
+        let shutdown_copy = shutdown.clone();
+        std::thread::spawn(move || {
+            let intv = Duration::from_secs_f64(intv);
+            loop {
+                if shutdown_copy.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = monitor_redis_groups() {
+                    debug!("redis monitor error: {e:#}");
+                }
+                std::thread::sleep(intv);
+            }
+        });
+    }
 
     let mut open_object = MaybeUninit::uninit();
     loop {
