@@ -109,6 +109,10 @@ impl Drop for Scheduler<'_> {
 fn monitor_redis_groups() -> Result<()> {
     // CPUs-per-group must match GROUP_SIZE in BPF.
     const GROUP_SIZE: usize = 8;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
 
     for proc_res in all_processes()? {
         let Ok(proc) = proc_res else { continue };
@@ -131,7 +135,7 @@ fn monitor_redis_groups() -> Result<()> {
             let cpu: usize = (cpu_i32 as u32) as usize;
             let group = cpu / GROUP_SIZE;
             println!(
-                "[redis pid={pid} tid={tid}] cpu={cpu} group={group}"
+                "{ts:.3} [redis pid={pid} tid={tid}] cpu={cpu} group={group}"
             );
         }
     }
