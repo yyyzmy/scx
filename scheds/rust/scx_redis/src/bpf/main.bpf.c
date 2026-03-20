@@ -16,6 +16,7 @@ UEI_DEFINE(uei);
 #define GROUP_SIZE	8
 #define MAX_GROUPS	(MAX_CPUS / GROUP_SIZE)
 #define PROC_FIXED_UNSET	0xffffffffU
+#define SMT_MAX_SIBLINGS 2
 
 #define STAT_LOCAL	0
 #define STAT_ENQ	1
@@ -60,6 +61,21 @@ struct {
 	__uint(value_size, sizeof(u32));
 	__uint(max_entries, 16384);
 } proc_fixed_cpu SEC(".maps");
+
+/* SMT: for each logical CPU, store thread_siblings_list (limited by SMT_MAX_SIBLINGS). */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32));
+	__uint(max_entries, MAX_CPUS);
+} cpu_smt_n SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32) * SMT_MAX_SIBLINGS);
+	__uint(max_entries, MAX_CPUS);
+} cpu_smt_sibs SEC(".maps");
 
 static void stat_inc(u32 idx)
 {
@@ -266,16 +282,62 @@ static s32 assign_redis_main_fixed_cpu(struct task_struct *p, s32 prev_cpu)
 	return (s32)fixed_u;
 }
 
+static __always_inline bool is_cpu_in_smt_siblings(u32 fixed_cpu, s32 candidate_cpu)
+{
+	u32 *n_p;
+	u32 *sib_p;
+	u32 n;
+	u32 i;
+
+	if (candidate_cpu < 0)
+		return false;
+
+	/* Always exclude the fixed CPU itself. */
+	if ((u32)candidate_cpu == fixed_cpu)
+		return true;
+
+	n_p = bpf_map_lookup_elem(&cpu_smt_n, &fixed_cpu);
+	sib_p = bpf_map_lookup_elem(&cpu_smt_sibs, &fixed_cpu);
+	if (!n_p || !sib_p)
+		return false;
+
+	n = *n_p;
+	bpf_for(i, 0, SMT_MAX_SIBLINGS) {
+		if (i >= n)
+			break;
+		if (sib_p[i] == (u32)candidate_cpu)
+			return true;
+	}
+	return false;
+}
+
 static s32 pick_best_cpu_in_group(struct task_struct *p, s32 prev_cpu, s32 group_id)
 {
 	u64 max = nr_cpu_ids < MAX_CPUS ? nr_cpu_ids : MAX_CPUS;
 	u32 base, i, cpu;
+	u32 tgid;
+	u32 *fp;
+	s32 fixed_cpu;
+	u32 fixed_cpu_u;
+	bool prev_excluded;
 
 	if (group_id < 0)
 		return -1;
 
+	/* Hard isolation: workers must not run on redis main thread fixed CPU. */
+	fixed_cpu = -1;
+	tgid = task_tgid(p);
+	fp = bpf_map_lookup_elem(&proc_fixed_cpu, &tgid);
+	if (fp && *fp != PROC_FIXED_UNSET)
+		fixed_cpu = (s32)*fp;
+	fixed_cpu_u = fixed_cpu >= 0 ? (u32)fixed_cpu : 0;
+	prev_excluded = (prev_cpu >= 0 && fixed_cpu >= 0)
+		? is_cpu_in_smt_siblings(fixed_cpu_u, prev_cpu)
+		: false;
+
 	if (prev_cpu >= 0 &&
 	    ((s32)(((u32)prev_cpu) / GROUP_SIZE) == group_id) &&
+	    !prev_excluded &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
 	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 		return prev_cpu;
@@ -286,6 +348,9 @@ static s32 pick_best_cpu_in_group(struct task_struct *p, s32 prev_cpu, s32 group
 		if (cpu >= (u32)max)
 			break;
 		if (!bpf_cpumask_test_cpu((s32)cpu, p->cpus_ptr))
+			continue;
+		/* Skip main thread fixed CPU and its SMT siblings. */
+		if (fixed_cpu >= 0 && is_cpu_in_smt_siblings(fixed_cpu_u, (s32)cpu))
 			continue;
 		if (scx_bpf_test_and_clear_cpu_idle((s32)cpu))
 			return (s32)cpu;

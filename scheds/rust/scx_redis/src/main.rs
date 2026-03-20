@@ -6,6 +6,8 @@ mod bpf_skel;
 pub use bpf_skel::*;
 
 use std::mem::MaybeUninit;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +29,82 @@ use scx_utils::UserExitInfo;
 use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 
 const SCHEDULER_NAME: &str = "scx_redis";
+const SMT_MAX_SIBLINGS: usize = 2;
+
+fn parse_cpu_list(list: &str) -> Vec<u32> {
+    let mut out = Vec::<u32>::new();
+    for part in list.trim().split(',').filter(|p| !p.trim().is_empty()) {
+        let part = part.trim();
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(start), Ok(end)) = (a.parse::<u32>(), b.parse::<u32>()) {
+                let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+                for v in lo..=hi {
+                    out.push(v);
+                }
+            }
+        } else if let Ok(v) = part.parse::<u32>() {
+            out.push(v);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn load_smt_topology_to_bpf(skel: &BpfSkel<'_>) -> Result<()> {
+    // Typical path: /sys/devices/system/cpu/cpu*/topology/thread_siblings_list
+    let cpu_root = Path::new("/sys/devices/system/cpu");
+    let Ok(entries) = fs::read_dir(cpu_root) else {
+        // If sysfs isn't accessible, fall back to "fixed CPU only" isolation.
+        return Ok(());
+    };
+
+    for ent in entries {
+        let Ok(ent) = ent else { continue };
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cpu") {
+            continue;
+        }
+        let Ok(cpu_id) = name[3..].parse::<u32>() else { continue };
+        if cpu_id >= 1024 {
+            continue; // matches MAX_CPUS in BPF
+        }
+
+        let sib_path = cpu_root.join(format!(
+            "{}/topology/thread_siblings_list",
+            name
+        ));
+        let Ok(sib_str) = fs::read_to_string(&sib_path) else {
+            continue;
+        };
+
+        let sibs = parse_cpu_list(&sib_str);
+        let n = (sibs.len() as usize).min(SMT_MAX_SIBLINGS);
+
+        let key = cpu_id.to_ne_bytes();
+        let n_bytes = (n as u32).to_ne_bytes();
+        skel.maps
+            .cpu_smt_n
+            .update(&key, &n_bytes, libbpf_rs::MapFlags::ANY)?;
+
+        let mut sib_arr = [0u32; SMT_MAX_SIBLINGS];
+        for (i, &sid) in sibs.iter().take(SMT_MAX_SIBLINGS).enumerate() {
+            sib_arr[i] = sid;
+        }
+        let sib_val = unsafe {
+            std::slice::from_raw_parts(
+                sib_arr.as_ptr() as *const u8,
+                std::mem::size_of_val(&sib_arr),
+            )
+        };
+        skel.maps
+            .cpu_smt_sibs
+            .update(&key, sib_val, libbpf_rs::MapFlags::ANY)?;
+    }
+
+    Ok(())
+}
 
 #[derive(Clone, Debug, Parser)]
 struct Opts {
@@ -123,6 +201,9 @@ impl<'a> Scheduler<'a> {
         rodata.fifo_sched = opts.fifo;
         rodata.main_slice_mult = opts.main_slice_mult;
         rodata.main_vtime_div = opts.main_vtime_div;
+
+        // Populate SMT siblings info so workers can exclude the whole physical core.
+        load_smt_topology_to_bpf(&skel)?;
 
         let mut skel = scx_ops_load!(skel, redis_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, redis_ops)?);
