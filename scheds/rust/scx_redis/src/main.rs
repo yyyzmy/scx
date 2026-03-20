@@ -51,7 +51,7 @@ fn parse_cpu_list(list: &str) -> Vec<u32> {
     out
 }
 
-fn load_smt_topology_to_bpf(skel: &OpenBpfSkel<'_>) -> Result<()> {
+fn load_smt_topology_to_bpf(skel: &mut BpfSkel<'_>) -> Result<()> {
     // Typical path: /sys/devices/system/cpu/cpu*/topology/thread_siblings_list
     let cpu_root = Path::new("/sys/devices/system/cpu");
     let Ok(entries) = fs::read_dir(cpu_root) else {
@@ -202,10 +202,10 @@ impl<'a> Scheduler<'a> {
         rodata.main_slice_mult = opts.main_slice_mult;
         rodata.main_vtime_div = opts.main_vtime_div;
 
-        // Populate SMT siblings info so workers can exclude the whole physical core.
-        load_smt_topology_to_bpf(&skel)?;
-
         let mut skel = scx_ops_load!(skel, redis_ops, uei)?;
+
+        // Populate SMT siblings info so workers can exclude the whole physical core.
+        load_smt_topology_to_bpf(&mut skel)?;
         let struct_ops = Some(scx_ops_attach!(skel, redis_ops)?);
 
         Ok(Self { skel, struct_ops, opts })
