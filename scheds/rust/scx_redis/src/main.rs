@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use libbpf_rs::MapCore;
 use libbpf_rs::OpenObject;
 use log::{debug, info};
 use procfs::process::all_processes;
