@@ -214,19 +214,21 @@ static s32 pick_group_for_task(struct task_struct *p, s32 prev_cpu)
 			return gid;
 	}
 
-	gid = get_group_id(prev_cpu);
-	if (gid >= 0 && (u32)gid < nr_groups && group_has_allowed_cpu(p, (u32)gid)) {
+	/* First-time assignment: prefer cross-process RR to achieve group spreading. */
+	gid = pick_rr_group(p);
+	if (gid >= 0) {
 		u32 ugid = (u32)gid;
 
 		bpf_map_update_elem(&proc_group, &tgid, &ugid, BPF_ANY);
 		return gid;
 	}
 
-	gid = pick_rr_group(p);
-	if (gid >= 0) {
+	/* RR fallback: if it failed, keep previous CPU group as a best-effort hint. */
+	gid = get_group_id(prev_cpu);
+	if (gid >= 0 && (u32)gid < nr_groups && group_has_allowed_cpu(p, (u32)gid)) {
 		u32 ugid = (u32)gid;
-
 		bpf_map_update_elem(&proc_group, &tgid, &ugid, BPF_ANY);
+		return gid;
 	}
 	return gid;
 }
