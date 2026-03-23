@@ -93,6 +93,8 @@ struct {
 	__uint(max_entries, MAX_CPUS);
 } cpu_main_busy SEC(".maps");
 
+static inline u32 task_tgid(const struct task_struct *p);
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt_p;
