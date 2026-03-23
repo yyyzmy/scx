@@ -54,6 +54,14 @@ struct {
 	__uint(max_entries, 16384);
 } proc_group SEC(".maps");
 
+/* Mark tgid as redis process so non-main comm (e.g. iou-sqp-*) is included. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u8));
+	__uint(max_entries, 16384);
+} redis_tgid SEC(".maps");
+
 /* redis-server main thread (tgid): pinned logical CPU */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -77,6 +85,14 @@ struct {
 	__uint(max_entries, MAX_CPUS);
 } cpu_smt_sibs SEC(".maps");
 
+/* Dynamic marker: CPU currently running a redis main thread. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u8));
+	__uint(max_entries, MAX_CPUS);
+} cpu_main_busy SEC(".maps");
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt_p;
@@ -93,6 +109,28 @@ static s32 get_group_id(s32 cpu)
 	if (cpu < 0 || cpu >= MAX_CPUS)
 		return -1;
 	return (s32)(((u32)cpu) / GROUP_SIZE);
+}
+
+static __always_inline bool is_kthread(const struct task_struct *p)
+{
+	return !!(BPF_CORE_READ(p, flags) & PF_KTHREAD);
+}
+
+static __always_inline bool is_pcpu_kthread(const struct task_struct *p)
+{
+	return is_kthread(p) && BPF_CORE_READ(p, nr_cpus_allowed) == 1;
+}
+
+static __always_inline bool is_main_busy_cpu(s32 cpu)
+{
+	u32 key;
+	u8 *v;
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids)
+		return false;
+	key = (u32)cpu;
+	v = bpf_map_lookup_elem(&cpu_main_busy, &key);
+	return v && *v;
 }
 
 static void inc_group_load_for_cpu(s32 cpu)
@@ -125,17 +163,28 @@ static bool is_redis_task(const struct task_struct *p)
 {
 	char comm[TASK_COMM_LEN];
 	int i;
+	u32 tgid;
+	u8 one = 1;
+	u8 *tagp;
 
 	if (bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm) <= 0)
-		return false;
+		goto check_tag;
 
 	const char pat[] = "redis-server";
 
 	for (i = 0; i < (int)sizeof(pat) - 1; i++) {
 		if (comm[i] != pat[i])
-			return false;
+			goto check_tag;
 	}
+	/* Learn this redis process once we see its main comm. */
+	tgid = task_tgid(p);
+	bpf_map_update_elem(&redis_tgid, &tgid, &one, BPF_ANY);
 	return true;
+
+check_tag:
+	tgid = task_tgid(p);
+	tagp = bpf_map_lookup_elem(&redis_tgid, &tgid);
+	return tagp && *tagp;
 }
 
 /* Thread group leader: main event-loop thread in typical Redis builds. */
@@ -380,6 +429,22 @@ s32 BPF_STRUCT_OPS(redis_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wa
 	s32 gid;
 	s32 fixed;
 
+	/*
+	 * Model from bpfland/flash: per-CPU kthreads are dispatched quickly.
+	 * But avoid kicking them onto a CPU currently occupied by redis main thread.
+	 */
+	if (is_pcpu_kthread(p)) {
+		if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+			prev_cpu = bpf_cpumask_first(p->cpus_ptr);
+		if (!is_main_busy_cpu(prev_cpu)) {
+			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+				kick_target_cpu(prev_cpu);
+			}
+			return prev_cpu;
+		}
+	}
+
 	if (!is_redis_task(p)) {
 		bool is_idle = false;
 
@@ -445,6 +510,17 @@ static void insert_redis_dsq(struct task_struct *p, u64 dsq, u64 enq_flags)
 
 void BPF_STRUCT_OPS(redis_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	/* Prioritize per-CPU kthreads, but avoid redis main busy CPUs. */
+	if (is_pcpu_kthread(p)) {
+		s32 cpu = scx_bpf_task_cpu(p);
+
+		if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr) && !is_main_busy_cpu(cpu)) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
+			kick_target_cpu(cpu);
+			return;
+		}
+	}
+
 	stat_inc(STAT_ENQ);
 
 	if (!is_redis_task(p)) {
@@ -489,14 +565,27 @@ void BPF_STRUCT_OPS(redis_dispatch, s32 cpu, struct task_struct *prev)
 {
 	s32 gid = get_group_id(cpu);
 
+	/*
+	 * Avoid starving non-redis kernel/user tasks in SHARED_DSQ
+	 * (e.g. ksoftirqd, iou-sqp) under heavy redis per-group traffic.
+	 */
+	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+
 	if (gid >= 0)
 		scx_bpf_dsq_move_to_local(group_dsq_id((u32)gid));
-
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 
 void BPF_STRUCT_OPS(redis_running, struct task_struct *p)
 {
+	u8 one = 1;
+
+	if (is_redis_main_thread(p)) {
+		u32 key = (u32)scx_bpf_task_cpu(p);
+
+		if (key < nr_cpu_ids)
+			bpf_map_update_elem(&cpu_main_busy, &key, &one, BPF_ANY);
+	}
+
 	if (fifo_sched)
 		return;
 
@@ -525,6 +614,14 @@ void BPF_STRUCT_OPS(redis_stopping, struct task_struct *p, bool runnable)
 {
 	u64 slice_grant;
 	u64 numer;
+	u8 zero = 0;
+
+	if (is_redis_main_thread(p)) {
+		u32 key = (u32)scx_bpf_task_cpu(p);
+
+		if (key < nr_cpu_ids)
+			bpf_map_update_elem(&cpu_main_busy, &key, &zero, BPF_ANY);
+	}
 
 	if (fifo_sched)
 		return;
