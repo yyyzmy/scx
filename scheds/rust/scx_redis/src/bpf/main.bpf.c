@@ -135,6 +135,25 @@ static __always_inline bool is_main_busy_cpu(s32 cpu)
 	return v && *v;
 }
 
+static __always_inline void cleanup_redis_proc_state(struct task_struct *p)
+{
+	u32 tgid, pid;
+
+	/* Cleanup only when redis main thread is exiting. */
+	if (!is_redis_task(p))
+		return;
+	pid = (u32)BPF_CORE_READ(p, pid);
+	tgid = task_tgid(p);
+	if (pid != tgid)
+		return;
+	if (!(BPF_CORE_READ(p, flags) & PF_EXITING))
+		return;
+
+	bpf_map_delete_elem(&proc_fixed_cpu, &tgid);
+	bpf_map_delete_elem(&proc_group, &tgid);
+	bpf_map_delete_elem(&redis_tgid, &tgid);
+}
+
 static void inc_group_load_for_cpu(s32 cpu)
 {
 	s32 gid = get_group_id(cpu);
@@ -624,6 +643,7 @@ void BPF_STRUCT_OPS(redis_stopping, struct task_struct *p, bool runnable)
 		if (key < nr_cpu_ids)
 			bpf_map_update_elem(&cpu_main_busy, &key, &zero, BPF_ANY);
 	}
+	cleanup_redis_proc_state(p);
 
 	if (fifo_sched)
 		return;
