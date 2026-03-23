@@ -135,6 +135,9 @@ static __always_inline bool is_main_busy_cpu(s32 cpu)
 	return v && *v;
 }
 
+static bool is_redis_task(const struct task_struct *p);
+static inline u32 task_tgid(const struct task_struct *p);
+
 static __always_inline void cleanup_redis_proc_state(struct task_struct *p)
 {
 	u32 tgid, pid;
