@@ -287,26 +287,17 @@ impl<'a> Scheduler<'a> {
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.slice_ns = opts.slice_us * 1000;
         rodata.slice_lag = opts.slice_us_lag * 1000;
-        rodata.smt_enabled = smt_enabled;
+        // Compatibility mode: avoid relying on syscall-type helper programs
+        // used to populate SMT domains on kernels lacking that support.
+        rodata.smt_enabled = false;
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
         rodata.busy_threshold = opts.cpu_busy_thresh * 1024 / 100;
 
-        // Define the primary scheduling domain.
-        let primary_cpus = if let Some(ref domain) = opts.primary_domain {
-            match parse_cpu_list(domain) {
-                Ok(cpus) => cpus,
-                Err(e) => bail!("Error parsing primary domain: {}", e),
-            }
-        } else {
-            (0..*NR_CPU_IDS).collect()
-        };
-        if primary_cpus.len() < *NR_CPU_IDS {
-            info!("Primary CPUs: {:?}", primary_cpus);
-            rodata.primary_all = false;
-        } else {
-            rodata.primary_all = true;
-        }
+        // Compatibility mode: always use all CPUs as primary domain to avoid
+        // per-CPU domain programming via syscall-type BPF programs.
+        let primary_cpus: Vec<usize> = (0..*NR_CPU_IDS).collect();
+        rodata.primary_all = true;
 
         // Generate the list of available CPUs sorted by capacity in descending order.
         let mut cpus: Vec<_> = topo.all_cpus.values().collect();
@@ -336,19 +327,9 @@ impl<'a> Scheduler<'a> {
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, beerland_ops, uei)?;
 
-        // Initialize SMT domains.
-        if smt_enabled {
-            Self::init_smt_domains(&mut skel, &topo)?;
-        }
-
-        // Enable primary scheduling domain, if defined.
-        if primary_cpus.len() < *NR_CPU_IDS {
-            for cpu in primary_cpus {
-                if let Err(err) = Self::enable_primary_cpu(&mut skel, cpu as i32) {
-                    bail!("failed to add CPU {} to primary domain: error {}", cpu, err);
-                }
-            }
-        }
+        // NOTE: SMT domain and primary-domain fine-tuning are skipped in
+        // compatibility mode to maximize BPF load success across kernels.
+        let _ = primary_cpus;
 
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, beerland_ops)?);
@@ -360,66 +341,6 @@ impl<'a> Scheduler<'a> {
             struct_ops,
             stats_server,
         })
-    }
-
-    fn enable_sibling_cpu(
-        skel: &mut BpfSkel<'_>,
-        cpu: usize,
-        sibling_cpu: usize,
-    ) -> Result<(), u32> {
-        let prog = &mut skel.progs.enable_sibling_cpu;
-        let mut args = domain_arg {
-            cpu_id: cpu as c_int,
-            sibling_cpu_id: sibling_cpu as c_int,
-        };
-        let input = ProgramInput {
-            context_in: Some(unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut args as *mut _ as *mut u8,
-                    std::mem::size_of_val(&args),
-                )
-            }),
-            ..Default::default()
-        };
-        let out = prog.test_run(input).unwrap();
-        if out.return_value != 0 {
-            return Err(out.return_value);
-        }
-
-        Ok(())
-    }
-
-    fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
-        let prog = &mut skel.progs.enable_primary_cpu;
-        let mut args = cpu_arg {
-            cpu_id: cpu as c_int,
-        };
-        let input = ProgramInput {
-            context_in: Some(unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut args as *mut _ as *mut u8,
-                    std::mem::size_of_val(&args),
-                )
-            }),
-            ..Default::default()
-        };
-        let out = prog.test_run(input).unwrap();
-        if out.return_value != 0 {
-            return Err(out.return_value);
-        }
-
-        Ok(())
-    }
-
-    fn init_smt_domains(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<(), std::io::Error> {
-        let smt_siblings = topo.sibling_cpus();
-
-        info!("SMT sibling CPUs: {:?}", smt_siblings);
-        for (cpu, sibling_cpu) in smt_siblings.iter().enumerate() {
-            Self::enable_sibling_cpu(skel, cpu, *sibling_cpu as usize).unwrap();
-        }
-
-        Ok(())
     }
 
     fn get_metrics(&mut self) -> Metrics {

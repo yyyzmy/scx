@@ -401,8 +401,7 @@ static int init_cpumask(struct bpf_cpumask **p_cpumask)
 	return *p_cpumask ? 0 : -ENOMEM;
 }
 
-SEC("syscall")
-int enable_sibling_cpu(struct domain_arg *input)
+static int enable_sibling_cpu(struct domain_arg *input)
 {
 	struct cpu_ctx *cctx;
 	struct bpf_cpumask *mask, **pmask;
@@ -431,8 +430,7 @@ int enable_sibling_cpu(struct domain_arg *input)
 /*
  * Called from user-space to add CPUs to the the primary domain.
  */
-SEC("syscall")
-int enable_primary_cpu(struct cpu_arg *input)
+static int enable_primary_cpu(struct cpu_arg *input)
 {
 	struct bpf_cpumask *mask;
 	int err = 0;
