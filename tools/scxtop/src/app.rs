@@ -317,7 +317,20 @@ impl<'a> App<'a> {
         let stats_client = Some(Arc::new(TokioMutex::new(stats_client)));
         let sample_rate = skel.maps.data_data.as_ref().unwrap().sample_rate;
         let trace_file_prefix = config.trace_file_prefix().to_string();
-        let trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
+        let mut trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
+
+        // Embed topology metadata in traces for cross-machine analysis
+        {
+            let mut cpu_to_llc = std::collections::HashMap::new();
+            let mut cpu_to_numa = std::collections::HashMap::new();
+            let mut cpu_to_core = std::collections::HashMap::new();
+            for cpu in topo.all_cpus.values() {
+                cpu_to_llc.insert(cpu.id as u32, cpu.llc_id as u32);
+                cpu_to_numa.insert(cpu.id as u32, cpu.node_id as u32);
+                cpu_to_core.insert(cpu.id as u32, cpu.core_id as u32);
+            }
+            trace_manager.set_topology(cpu_to_llc, cpu_to_numa, cpu_to_core);
+        }
 
         // There isn't a 'is_loaded' method on a prog in libbpf-rs so do the next best thing and
         // try to infer from the fd
@@ -564,7 +577,20 @@ impl<'a> App<'a> {
         // Default sample rate for non-BPF mode
         let sample_rate = 1000; // Default value when BPF is not available
         let trace_file_prefix = config.trace_file_prefix().to_string();
-        let trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
+        let mut trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
+
+        // Embed topology metadata in traces for cross-machine analysis
+        {
+            let mut cpu_to_llc = std::collections::HashMap::new();
+            let mut cpu_to_numa = std::collections::HashMap::new();
+            let mut cpu_to_core = std::collections::HashMap::new();
+            for cpu in topo.all_cpus.values() {
+                cpu_to_llc.insert(cpu.id as u32, cpu.llc_id as u32);
+                cpu_to_numa.insert(cpu.id as u32, cpu.node_id as u32);
+                cpu_to_core.insert(cpu.id as u32, cpu.core_id as u32);
+            }
+            trace_manager.set_topology(cpu_to_llc, cpu_to_numa, cpu_to_core);
+        }
 
         // No hardware pressure monitoring without BPF
         let hw_pressure = false;
@@ -1616,7 +1642,8 @@ impl<'a> App<'a> {
 
                     let line_gauge = LineGauge::default()
                         .ratio(ratio)
-                        .line_set(THICK)
+                        .filled_symbol(THICK.horizontal)
+                        .unfilled_symbol(THICK.horizontal)
                         .label(Line::from(label).style(self.theme().text_color()))
                         .filled_style(Style::default().fg(gradient_color).bg(Color::Reset))
                         .unfilled_style(
@@ -1844,7 +1871,8 @@ impl<'a> App<'a> {
                     let line_gauge = LineGauge::default()
                         .ratio(ratio)
                         .label(Line::from(label).style(self.theme().text_color()))
-                        .line_set(THICK)
+                        .filled_symbol(THICK.horizontal)
+                        .unfilled_symbol(THICK.horizontal)
                         .filled_style(Style::default().fg(gradient_color).bg(Color::Reset))
                         .unfilled_style(
                             Style::default()
@@ -2387,7 +2415,8 @@ impl<'a> App<'a> {
                     let line_gauge = LineGauge::default()
                         .ratio(ratio)
                         .label(Line::from(label).style(self.theme().text_color()))
-                        .line_set(THICK)
+                        .filled_symbol(THICK.horizontal)
+                        .unfilled_symbol(THICK.horizontal)
                         .filled_style(Style::default().fg(gradient_color))
                         .unfilled_style(
                             Style::default().fg(self

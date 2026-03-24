@@ -60,18 +60,11 @@ static inline void ___vmlinux_h_sanity_check___(void)
 
 s32 scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle) __ksym;
-s32 scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
-			   const struct cpumask *cpus_allowed, u64 flags) __ksym __weak;
-void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
-void scx_bpf_dsq_insert_vtime(struct task_struct *p, u64 dsq_id, u64 slice, u64 vtime, u64 enq_flags) __ksym __weak;
+s32 __scx_bpf_select_cpu_and(struct task_struct *p, const struct cpumask *cpus_allowed,
+			     struct scx_bpf_select_cpu_and_args *args) __ksym __weak;
+bool __scx_bpf_dsq_insert_vtime(struct task_struct *p, struct scx_bpf_dsq_insert_vtime_args *args) __ksym __weak;
 u32 scx_bpf_dispatch_nr_slots(void) __ksym;
 void scx_bpf_dispatch_cancel(void) __ksym;
-bool scx_bpf_dsq_move_to_local(u64 dsq_id) __ksym __weak;
-void scx_bpf_dsq_move_set_slice(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
-void scx_bpf_dsq_move_set_vtime(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
-bool scx_bpf_dsq_move(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
-bool scx_bpf_dsq_move_vtime(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
-u32 scx_bpf_reenqueue_local(void) __ksym;
 void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
 s32 scx_bpf_dsq_nr_queued(u64 dsq_id) __ksym;
 void scx_bpf_destroy_dsq(u64 dsq_id) __ksym;
@@ -104,11 +97,11 @@ s32 scx_bpf_pick_any_cpu(const cpumask_t *cpus_allowed, u64 flags) __ksym;
 bool scx_bpf_task_running(const struct task_struct *p) __ksym;
 s32 scx_bpf_task_cpu(const struct task_struct *p) __ksym;
 struct rq *scx_bpf_cpu_rq(s32 cpu) __ksym;
-struct rq *scx_bpf_rq_locked(void) __ksym;
+struct rq *scx_bpf_locked_rq(void) __ksym;
 struct task_struct *scx_bpf_cpu_curr(s32 cpu) __ksym __weak;
-struct cgroup *scx_bpf_task_cgroup(struct task_struct *p) __ksym __weak;
 u64 scx_bpf_now(void) __ksym __weak;
 void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __weak;
+bool scx_bpf_sub_dispatch(u64 cgroup_id) __ksym __weak;
 
 /*
  * Use the following as @it__iter when calling scx_bpf_dsq_move[_vtime]() from
@@ -840,21 +833,21 @@ static inline int ctzll(u64 v)
 
 	/*
 	 * Each isolated bit produces a unique 6-bit value, guaranteed by the
-	 * De Bruijn property. Calculate a unique index into the lookup table
+	 * De Bruijn property. Calculate a unique index into the lookup table
 	 * using the magic constant and a right shift.
 	 *
-	 * Multiplying by the 64-bit constant “spreads out” that 1-bit into a
+	 * Multiplying by the 64-bit constant "spreads out" that 1-bit into a
 	 * unique pattern in the top 6 bits. This uniqueness property is
-	 * exactly what a De Bruijn sequence guarantees: Every possible 6-bit
+	 * exactly what a De Bruijn sequence guarantees: Every possible 6-bit
 	 * pattern (in top bits) occurs exactly once for each LSB position. So,
 	 * the constant 0x03f79d71b4cb0a89ULL is carefully chosen to be a
-	 * De Bruijn sequence, ensuring no collisions in the table index.
+	 * De Bruijn sequence, ensuring no collisions in the table index.
 	 */
 	index = (lowest_bit * DEBRUIJN_CONSTANT) >> 58;
 
 	/*
 	 * Lookup in a precomputed table. No collision is guaranteed by the
-	 * De Bruijn property.
+	 * De Bruijn property.
 	 */
 	lt = MEMBER_VPTR(lookup_table, [index]);
 	return (lt)? *lt : -1;
@@ -876,6 +869,7 @@ static inline u64 scale_by_task_weight_inverse(const struct task_struct *p, u64 
 {
 	return value * 100 / p->scx.weight;
 }
+
 
 /*
  * Get a random u64 from the kernel's pseudo-random generator.
@@ -989,7 +983,20 @@ static inline u64 scx_clock_task(u32 cpu)
 {
 	struct rq___local *rq = get_current_rq(cpu);
 
-	/* Equivalent to the kernel's rq_clock_task(). */
+	/*
+	 * Equivalent to the kernel's rq_clock_task(): wall-clock time minus
+	 * cumulative IRQ time (CONFIG_IRQ_TIME_ACCOUNTING) and hypervisor
+	 * steal time (CONFIG_PARAVIRT_TIME_ACCOUNTING). Without those configs,
+	 * it equals rq->clock.
+	 *
+	 * Conceptually this clock advances during idle (the idle task counts
+	 * as a running task), but rq->clock_task is only updated on scheduling
+	 * events. With NO_HZ_IDLE (the default), the periodic tick is stopped
+	 * on idle CPUs, so rq->clock_task is not refreshed while a CPU is
+	 * idle. Reading this clock for a remote idle CPU from a BPF timer
+	 * callback returns the value from when the CPU last went idle, making
+	 * the delta over an idle interval effectively zero.
+	 */
 	return rq ? rq->clock_task : 0;
 }
 
@@ -1000,9 +1007,23 @@ static inline u64 scx_clock_pelt(u32 cpu)
 	/*
 	 * Equivalent to the kernel's rq_clock_pelt(): subtracts
 	 * lost_idle_time from clock_pelt to absorb the jump that occurs
-	 * when clock_pelt resyncs with clock_task at idle exit. The result
-	 * is a continuous, capacity-invariant clock safe for both task
-	 * execution time stamping and cross-idle measurements.
+	 * when clock_pelt resyncs with clock_task at idle exit. The intent
+	 * is a continuous, capacity- and frequency-invariant clock that is
+	 * frozen during idle, IRQ, and hypervisor steal.
+	 *
+	 * However, like scx_clock_task(), this clock has a stale-read issue
+	 * for remote idle CPUs with NO_HZ_IDLE (the default). clock_pelt
+	 * itself advances at wall-clock rate (hardware-clock based), but
+	 * lost_idle_time is only updated via update_rq_clock_pelt(), which
+	 * requires update_rq_clock() to be called. With NO_HZ_IDLE, the
+	 * periodic tick is stopped on idle CPUs, so lost_idle_time is not
+	 * refreshed during idle. Reading this clock for a remote idle CPU
+	 * from a BPF timer callback therefore returns a value that drifts
+	 * at wall-clock rate -- the same stale behaviour as scx_clock_task().
+	 *
+	 * Without NO_HZ_IDLE, periodic ticks keep lost_idle_time nearly in
+	 * sync (stale by at most one tick period, ~1 ms), so the result is
+	 * accurate.
 	 */
 	return rq ? (rq->clock_pelt - rq->lost_idle_time) : 0;
 }

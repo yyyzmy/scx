@@ -221,6 +221,11 @@ static u64 min(u64 a, u64 b)
 	return a <= b ? a : b;
 }
 
+static __always_inline bool vtime_before(u64 a, u64 b)
+{
+	return (s64)(a - b) < 0;
+}
+
 static __always_inline u64 dsq_time_slice(int dsq_index)
 {
 	if (dsq_index > p2dq_config.nr_dsqs_per_llc || dsq_index < 0) {
@@ -943,9 +948,11 @@ static void update_vtime(struct task_struct *p, struct cpu_ctx *cpuc,
 			return;
 
 		u64 scaled_min = scale_by_task_weight(p, max_dsq_time_slice());
+		u64 vtime_floor = (llcx->vtime > scaled_min) ?
+				  llcx->vtime - scaled_min : 0;
 
-		if (p->scx.dsq_vtime < llcx->vtime - scaled_min)
-			p->scx.dsq_vtime = llcx->vtime - scaled_min;
+		if (p->scx.dsq_vtime < vtime_floor)
+			p->scx.dsq_vtime = vtime_floor;
 
 		return;
 	}
@@ -2455,7 +2462,7 @@ static bool consume_llc(struct llc_ctx *llcx)
 					 taskc->enq_flags);
 		bpf_task_release(p);
 
-		if (scx_bpf_dsq_move_to_local(cpuc->llc_dsq))
+		if (scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0))
 			return true;
 
 		goto try_dsq;
@@ -2477,10 +2484,10 @@ static bool consume_llc(struct llc_ctx *llcx)
 					 taskc->enq_flags);
 		bpf_task_release(p);
 
-		return scx_bpf_dsq_move_to_local(cpuc->llc_dsq);
+		return scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0);
 	}
 try_dsq:
-	if (likely(scx_bpf_dsq_move_to_local(llcx->mig_dsq))) {
+	if (likely(scx_bpf_dsq_move_to_local(llcx->mig_dsq, 0))) {
 		stat_inc(P2DQ_STAT_DISPATCH_PICK2);
 		return true;
 	}
@@ -2662,7 +2669,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 						if (target_cpu >= 0 && target_cpu < NR_CPUS) {
 							target_cpuc = lookup_cpu_ctx(target_cpu);
 							if (target_cpuc) {
-								__COMPAT_scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER,
+								scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER,
 												p,
 												target_cpuc->affn_dsq,
 												0);
@@ -2710,7 +2717,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 			// Peek at the other CPU's affn_dsq
 			p = __COMPAT_scx_bpf_dsq_peek(other_cpuc->affn_dsq);
 			if (p && peek_cpumask_test_cpu(cpu, p) &&
-			    (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+			    (vtime_before(p->scx.dsq_vtime, min_vtime) || min_vtime == 0)) {
 				min_vtime = p->scx.dsq_vtime;
 				dsq_id = other_cpuc->affn_dsq;
 			}
@@ -2720,7 +2727,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 check_llc_dsq:
 	// LLC DSQ for vtime comparison
 	p = __COMPAT_scx_bpf_dsq_peek(cpuc->llc_dsq);
-	if (p && (p->scx.dsq_vtime < min_vtime || min_vtime == 0) &&
+	if (p && (vtime_before(p->scx.dsq_vtime, min_vtime) || min_vtime == 0) &&
 	    peek_cpumask_test_cpu(cpu, p)) {
 		min_vtime = p->scx.dsq_vtime;
 		dsq_id = cpuc->llc_dsq;
@@ -2732,7 +2739,7 @@ check_llc_dsq:
 			pid = scx_dhq_peek_strand(cpuc->mig_dhq, cpuc->dhq_strand);
 			if (pid && (p = bpf_task_from_pid((s32)pid))) {
 				if (likely(bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) &&
-				    (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+				    (vtime_before(p->scx.dsq_vtime, min_vtime) || min_vtime == 0)) {
 					min_vtime = p->scx.dsq_vtime;
 					min_dhq = cpuc->mig_dhq;
 				}
@@ -2742,7 +2749,7 @@ check_llc_dsq:
 			pid = scx_atq_peek(cpuc->mig_atq);
 			if ((p = bpf_task_from_pid((s32)pid))) {
 				if (likely(bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) &&
-				    (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+				    (vtime_before(p->scx.dsq_vtime, min_vtime) || min_vtime == 0)) {
 					min_vtime = p->scx.dsq_vtime;
 					min_atq = cpuc->mig_atq;
 					/*
@@ -2759,7 +2766,7 @@ check_llc_dsq:
 			// Peek migration DSQ - only consider tasks that can run here
 			p = __COMPAT_scx_bpf_dsq_peek(cpuc->mig_dsq);
 			if (p && likely(peek_cpumask_test_cpu(cpu, p)) &&
-			    (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+			    (vtime_before(p->scx.dsq_vtime, min_vtime) || min_vtime == 0)) {
 				min_vtime = p->scx.dsq_vtime;
 				dsq_id = cpuc->mig_dsq;
 			}
@@ -2794,7 +2801,7 @@ check_llc_dsq:
 			bpf_task_release(p);
 
 			/* Try to dispatch - move_to_local handles affinity atomically */
-			scx_bpf_dsq_move_to_local(cpuc->llc_dsq);
+			scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0);
 			return;
 		}
 	} else if (unlikely(min_atq)) {
@@ -2815,11 +2822,11 @@ check_llc_dsq:
 						 taskc->enq_flags);
 			bpf_task_release(p);
 
-			scx_bpf_dsq_move_to_local(cpuc->llc_dsq);
+			scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0);
 			return;
 		}
 	} else {
-		if (likely(valid_dsq(dsq_id) && scx_bpf_dsq_move_to_local(dsq_id)))
+		if (likely(valid_dsq(dsq_id) && scx_bpf_dsq_move_to_local(dsq_id, 0)))
 			return;
 	}
 
@@ -2828,7 +2835,7 @@ check_llc_dsq:
 	if (likely(p2dq_config.llc_shards > 1)) {
 		// First try the current CPU's assigned shard
 		if (dsq_id != cpuc->llc_dsq &&
-		    scx_bpf_dsq_move_to_local(cpuc->llc_dsq))
+		    scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0))
 			return;
 
 		if ((llcx = lookup_llc_ctx(cpuc->llc_id)) && llcx->nr_shards > 1) {
@@ -2841,14 +2848,14 @@ check_llc_dsq:
 				if (shard_idx < MAX_LLC_SHARDS && shard_idx < llcx->nr_shards) {
 					u64 shard_dsq = *MEMBER_VPTR(llcx->shard_dsqs, [shard_idx]);
 					if (shard_dsq != cpuc->llc_dsq && shard_dsq != dsq_id &&
-					    scx_bpf_dsq_move_to_local(shard_dsq))
+					    scx_bpf_dsq_move_to_local(shard_dsq, 0))
 						return;
 				}
 			}
 		}
 	} else {
 		if (dsq_id != cpuc->llc_dsq &&
-		    scx_bpf_dsq_move_to_local(cpuc->llc_dsq))
+		    scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0))
 			return;
 	}
 
@@ -2868,7 +2875,7 @@ check_llc_dsq:
 						 taskc->enq_flags);
 			bpf_task_release(p);
 
-			scx_bpf_dsq_move_to_local(cpuc->llc_dsq);
+			scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0);
 		}
 	} else if (unlikely(p2dq_config.atq_enabled)) {
 		pid = scx_atq_pop(cpuc->mig_atq);
@@ -2886,12 +2893,12 @@ check_llc_dsq:
 						 taskc->enq_flags);
 			bpf_task_release(p);
 
-			scx_bpf_dsq_move_to_local(cpuc->llc_dsq);
+			scx_bpf_dsq_move_to_local(cpuc->llc_dsq, 0);
 			return;
 		}
 	} else {
 		if (likely(cpuc && dsq_id != cpuc->mig_dsq &&
-		    scx_bpf_dsq_move_to_local(cpuc->mig_dsq)))
+		    scx_bpf_dsq_move_to_local(cpuc->mig_dsq, 0)))
 			return;
 	}
 

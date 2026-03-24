@@ -808,7 +808,7 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, s32 prev_cpu, u64 wake_f
 	const struct cpumask *primary;
 	s32 cpu;
 
-	if (!builtin_idle || !bpf_ksym_exists(scx_bpf_select_cpu_and))
+	if (!builtin_idle || !__COMPAT_HAS_scx_bpf_select_cpu_and)
 		return -ENOENT;
 
 	primary = cast_mask(primary_cpumask);
@@ -1556,13 +1556,13 @@ void BPF_STRUCT_OPS(flash_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Try to consume a task from the per-CPU DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
 		return;
 
 	/*
 	 * Try to consume a task from the per-node DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(node_to_dsq(node)))
+	if (scx_bpf_dsq_move_to_local(node_to_dsq(node), 0))
 		return;
 
 	/*

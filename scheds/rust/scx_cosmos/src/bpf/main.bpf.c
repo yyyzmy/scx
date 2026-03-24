@@ -81,6 +81,11 @@ const volatile u64 preferred_cpus[MAX_CPUS];
 const volatile u64 cpu_capacity[MAX_CPUS];
 
 /*
+ * True when all CPUs have the same capacity (no capacity asymmetry).
+ */
+const volatile bool all_cpus_same_capacity = false;
+
+/*
  * Enable cpufreq integration.
  */
 const volatile bool cpufreq_enabled = true;
@@ -118,11 +123,6 @@ const volatile u64 perf_config;
 volatile u64 perf_threshold;
 
 /*
- * Enable deferred wakeup.
- */
-const volatile bool deferred_wakeups = true;
-
-/*
  * Sticky perf event (0x0 = disabled). When task's count for this event
  * exceeds perf_sticky_threshold, keep it on the same CPU.
  */
@@ -144,9 +144,14 @@ const volatile bool tick_preempt = true;
 const volatile bool no_wake_sync;
 
 /*
+ * Disable early clearing of idle CPU state.
+ */
+const volatile bool no_early_clear;
+
+/*
  * Default time slice.
  */
-const volatile u64 slice_ns = 10000ULL;
+const volatile u64 slice_ns = 1000000ULL;
 
 /*
  * Maximum runtime that can be charged to a task.
@@ -159,9 +164,15 @@ const volatile u64 slice_lag = 20000000ULL;
 const volatile u64 busy_threshold;
 
 /*
- * Current global CPU utilization percentage in the range [0 .. 1024].
+ * Per-CPU user utilization in the range [0 .. 1024], updated periodically
+ * from userspace. Indexed by CPU id.
  */
-volatile u64 cpu_util;
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_CPUS);
+	__type(key, u32);
+	__type(value, u64);
+} cpu_util_map SEC(".maps");
 
 /*
  * Scheduler statistics.
@@ -400,7 +411,7 @@ static u64 update_freq(u64 freq, u64 interval)
  */
 static void update_cpu_load(struct task_struct *p, u64 slice)
 {
-	u64 now = scx_bpf_now();
+	u64 now = bpf_ktime_get_ns();
 	s32 cpu = scx_bpf_task_cpu(p);
 	u64 perf_lvl, delta_t;
 	struct cpu_ctx *cctx;
@@ -531,6 +542,14 @@ static s32 pick_cpu_on_gpu_node(const struct task_struct *p, int node,
 }
 
 /*
+ * Return true if @p still wants to run, false otherwise.
+ */
+static bool is_task_queued(const struct task_struct *p)
+{
+	return p->scx.flags & SCX_TASK_QUEUED;
+}
+
+/*
  * Return true if @p can only run on a single CPU, false otherwise.
  */
 static inline bool is_pcpu_task(const struct task_struct *p)
@@ -539,36 +558,27 @@ static inline bool is_pcpu_task(const struct task_struct *p)
 }
 
 /*
- * Return true if the system is busy, false otherwise.
+ * Return true if the given CPU is busy, false otherwise.
  *
- * This function determines when the scheduler needs to switch to
- * deadline-mode (using a shared DSQ) vs round-robin mode (using per-CPU
- * local DSQs).
+ * @cpu should be the CPU of interest: prev_cpu in select_cpu/enqueue, or
+ * scx_bpf_task_cpu(p) in tick.
+ *
+ * This determines when the scheduler needs to switch to deadline-mode
+ * (using a shared DSQ) vs round-robin mode (using per-CPU local DSQs).
  */
-static inline bool is_system_busy(void)
+static inline bool is_cpu_busy(s32 cpu)
 {
-	return cpu_util >= busy_threshold;
-}
+	u64 *util;
+	u64 max_cpu = MIN(nr_cpu_ids, MAX_CPUS);
 
-/*
- * Return true if the CPU is running the idle thread, false otherwise.
- */
-static inline bool is_cpu_idle(s32 cpu)
-{
-	struct task_struct *p;
-	bool idle;
-
-	bpf_rcu_read_lock();
-	p = __COMPAT_scx_bpf_cpu_curr(cpu);
-
-	if (!p) {
-		bpf_rcu_read_unlock();
-		scx_bpf_error("Failed to access rq->curr %d", cpu);
+	if (cpu < 0 || cpu >= max_cpu)
 		return false;
-	}
-	idle = p->flags & PF_IDLE;
-	bpf_rcu_read_unlock();
-	return idle;
+
+	util = bpf_map_lookup_elem(&cpu_util_map, &cpu);
+	if (!util)
+		return false;
+
+	return *util >= busy_threshold;
 }
 
 /*
@@ -651,13 +661,47 @@ static inline bool cpus_share_cache(s32 this_cpu, s32 that_cpu)
  */
 static inline bool is_cpu_faster(s32 this_cpu, s32 that_cpu)
 {
-	if (this_cpu == that_cpu)
+	if (all_cpus_same_capacity || this_cpu == that_cpu)
 		return false;
 
 	if (!is_cpu_valid(this_cpu) || !is_cpu_valid(that_cpu))
 		return false;
 
 	return cpu_capacity[this_cpu] > cpu_capacity[that_cpu];
+}
+
+/*
+ * Return true if @cpu is in the primary domain, false otherwise.
+ */
+static inline bool is_primary_cpu(s32 cpu)
+{
+	const struct cpumask *mask = cast_mask(primary_cpumask);
+
+	if (primary_all)
+		return true;
+
+	return mask && bpf_cpumask_test_cpu(cpu, mask);
+}
+
+static inline bool is_cpu_idle(s32 cpu)
+{
+	struct task_struct *p;
+
+	p = __COMPAT_scx_bpf_cpu_curr(cpu);
+
+	return p ? p->flags & PF_IDLE : false;
+}
+
+/*
+ * Test if a CPU is idle.
+ *
+ * If no_early_clear is true, leave the idle state intact so that concurrent
+ * wakeups can stack tasks on the same cache. Otherwise, atomically test and
+ * clear the idle state.
+ */
+static inline bool test_cpu_idle(s32 cpu)
+{
+	return no_early_clear ? is_cpu_idle(cpu) : scx_bpf_test_and_clear_cpu_idle(cpu);
 }
 
 /*
@@ -675,7 +719,7 @@ static s32 pick_idle_cpu_pref_smt(struct task_struct *p, s32 prev_cpu, bool is_p
 	if (is_prev_allowed &&
 	    (!primary || bpf_cpumask_test_cpu(prev_cpu, primary)) &&
 	    (!smt || bpf_cpumask_test_cpu(prev_cpu, smt)) &&
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+	    test_cpu_idle(prev_cpu))
 		return prev_cpu;
 
 	start = last_cpu;
@@ -693,7 +737,7 @@ static s32 pick_idle_cpu_pref_smt(struct task_struct *p, s32 prev_cpu, bool is_p
 
 		if ((!primary || bpf_cpumask_test_cpu(cpu, primary)) &&
 		    (!smt || bpf_cpumask_test_cpu(cpu, smt)) &&
-		    scx_bpf_test_and_clear_cpu_idle(cpu)) {
+		    test_cpu_idle(cpu)) {
 			if (!preferred_idle_scan)
 				last_cpu = cpu + 1;
 			return cpu;
@@ -721,7 +765,7 @@ static s32 pick_idle_cpu_flat(struct task_struct *p, s32 prev_cpu)
 	 * CPUs.
 	 */
 	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
-		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		if (test_cpu_idle(prev_cpu)) {
 			cpu = prev_cpu;
 			goto out;
 		}
@@ -792,7 +836,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
 	 * scan is enabled, unless the system is busy, in which case the
 	 * cpumask-based scanning is more efficient.
 	 */
-	if ((flat_idle_scan || preferred_idle_scan) && !is_system_busy())
+	if ((flat_idle_scan || preferred_idle_scan) && !is_cpu_busy(prev_cpu))
 		return pick_idle_cpu_flat(p, prev_cpu);
 
 	/*
@@ -817,7 +861,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
 		 */
 		if (cpus_share_cache(this_cpu, prev_cpu) &&
 		    !is_smt_contended(prev_cpu) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		    test_cpu_idle(prev_cpu))
 			return prev_cpu;
 
 		prev_cpu = this_cpu;
@@ -829,7 +873,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
 	 *
 	 * This is required to support kernels <= 6.16.
 	 */
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		bool is_idle = false;
 
 		if (from_enqueue)
@@ -975,38 +1019,6 @@ int enable_primary_cpu(struct cpu_arg *input)
 }
 
 /*
- * Kick idle CPUs with pending tasks.
- *
- * Instead of waking up CPU when tasks are enqueued, we defer the wakeup
- * using this timer handler, in order to have a faster enqueue hot path.
- */
-static int wakeup_timerfn(void *map, int *key, struct bpf_timer *timer)
-{
-	s32 cpu;
-	int err;
-
-	/*
-	 * Iterate over all CPUs and wake up those that have pending tasks
-	 * in their local DSQ.
-	 *
-	 * Note that tasks are only enqueued in ops.enqueue(), but we never
-	 * wake-up the CPUs from there to reduce overhead in the hot path.
-         */
-	bpf_for(cpu, 0, nr_cpu_ids)
-		if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) && is_cpu_idle(cpu))
-			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-
-	/*
-	 * Re-arm the wakeup timer.
-	 */
-	err = bpf_timer_start(timer, slice_ns, 0);
-	if (err)
-		scx_bpf_error("Failed to re-arm wakeup timer");
-
-	return 0;
-}
-
-/*
  * Return true if the task should attempt a migration, false otherwise.
  */
 static bool task_should_migrate(struct task_struct *p, u64 enq_flags)
@@ -1029,45 +1041,13 @@ is_wake_affine(const struct task_struct *waker, const struct task_struct *wakee)
 		!(waker->flags & PF_EXITING) && wakee->mm && (wakee->mm == waker->mm);
 }
 
-/*
- * Look for the least busy cpu based on perf_event count. Look within the
- * same node as prev_cpu, otherwise this optimization becomes expensive on
- * large CPU numa systems
- */
-static int pick_least_busy_event_cpu(const struct task_struct *p, s32 prev_cpu,
-				     const struct task_ctx *tctx)
-{
-	struct cpu_ctx *cctx;
-	u64 min = ~0UL;
-	int cpu, ret_cpu = -EBUSY;
-
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (cpu_node(cpu) != cpu_node(prev_cpu) ||
-		    !is_cpu_idle(cpu) ||
-		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-			continue;
-
-		cctx = try_lookup_cpu_ctx(cpu);
-		if (!cctx)
-			continue;
-
-		if (cctx->perf_events < min) {
-			min = cctx->perf_events;
-			ret_cpu = cpu;
-		}
-	}
-
-	return ret_cpu;
-}
-
 s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	const struct task_struct *current = (void *)bpf_get_current_task_btf();
 	struct task_ctx *tctx;
-	bool is_busy = is_system_busy();
+	bool is_busy = is_cpu_busy(prev_cpu);
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
-	int new_cpu;
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
@@ -1110,28 +1090,6 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	}
 
 	/*
-	 * Pick an event free CPU: if task exceeds sticky threshold, keep
-	 * on same CPU, if it exceeds migration threshold, move to least
-	 * event-busy CPU.
-	 */
-	if (perf_config || perf_sticky) {
-		if (is_sticky_event_heavy(tctx)) {
-			__sync_fetch_and_add(&nr_ev_sticky_dispatches, 1);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
-			return prev_cpu;
-		}
-
-		if (is_event_heavy(tctx)) {
-			__sync_fetch_and_add(&nr_event_dispatches, 1);
-			new_cpu = pick_least_busy_event_cpu(p, prev_cpu, tctx);
-			if (new_cpu >= 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
-				return new_cpu;
-			}
-		}
-	}
-
-	/*
 	 * Try to find an idle CPU and dispatch the task directly to the
 	 * target CPU.
 	 *
@@ -1145,21 +1103,6 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
 
 	return cpu >= 0 ? cpu : prev_cpu;
-}
-
-/*
- * Wake-up @cpu if it's idle.
- */
-static inline void wakeup_cpu(s32 cpu)
-{
-	/*
-	 * If deferred wakeups are enabled all the wakeup events are
-	 * performed asynchronously by wakeup_timerfn().
-	 */
-	if (deferred_wakeups)
-		return;
-
-	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 void BPF_STRUCT_OPS(cosmos_tick, struct task_struct *p)
@@ -1182,13 +1125,13 @@ void BPF_STRUCT_OPS(cosmos_tick, struct task_struct *p)
 	 * - the system is busy and there are tasks waiting in the
 	 *   local or shared DSQ.
 	 */
-	if (time_delta(scx_bpf_now(), tctx->last_run_at) > task_slice(p)) {
+	if (time_delta(bpf_ktime_get_ns(), tctx->last_run_at) > task_slice(p)) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		bool smt_contention = avoid_smt && is_smt_contended(cpu);
 		bool cpu_busy = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) ||
 				scx_bpf_dsq_nr_queued(shared_dsq(cpu));
 
-		if (smt_contention || (is_system_busy() && cpu_busy))
+		if (smt_contention || (is_cpu_busy(cpu) && cpu_busy))
 			p->scx.slice = 0;
 	}
 }
@@ -1198,7 +1141,6 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
 	int node = cpu_node(prev_cpu);
 	struct task_ctx *tctx;
-	int new_cpu;
 
 	/*
 	 * Dispatch the task to the shared DSQ, using the deadline-based
@@ -1221,36 +1163,30 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
 					   task_slice(p), enq_flags);
 			if (cpu != prev_cpu || !scx_bpf_task_running(p))
-				wakeup_cpu(cpu);
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 			return;
 		}
 	}
 
 	/*
-	 * Immediately dispatch sticky event-heavy tasks to the same CPU.
+	 * Attempt to immediately dispatch sticky event-heavy tasks to the
+	 * same CPU.
 	 */
-	if (is_sticky_event_heavy(tctx)) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), enq_flags);
-		__sync_fetch_and_add(&nr_ev_sticky_dispatches, 1);
+	if (is_sticky_event_heavy(tctx) &&
+	    (is_primary_cpu(prev_cpu) || is_pcpu_task(p)) &&
+	    (!avoid_smt || !is_smt_contended(prev_cpu))) {
+		const struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(shared_dsq(prev_cpu));
 
-		if (!scx_bpf_task_running(p))
-			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
-		return;
-	}
+		/*
+		 * If a per-CPU task is waiting to acquire the CPU, skip
+		 * direct dispatch to prevent starvation.
+		 */
+		if (!q || q->nr_cpus_allowed > 1) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), enq_flags);
+			__sync_fetch_and_add(&nr_ev_sticky_dispatches, 1);
 
-	/*
-	 * Immediately dispatch migration event-heavy tasks to a new CPU
-	 * (if the task is allowed to migrate).
-	 */
-	if (!is_migration_disabled(p) && is_event_heavy(tctx)) {
-		new_cpu = pick_least_busy_event_cpu(p, prev_cpu, tctx);
-		if (new_cpu >= 0) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | new_cpu,
-					   task_slice(p), enq_flags);
-			__sync_fetch_and_add(&nr_event_dispatches, 1);
-
-			if (new_cpu != prev_cpu || !scx_bpf_task_running(p))
-				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+			if (!scx_bpf_task_running(p))
+				scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 			return;
 		}
 	}
@@ -1259,26 +1195,33 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Attempt to dispatch directly to an idle CPU if the task can
 	 * migrate.
 	 */
-	if (task_should_migrate(p, enq_flags)) {
+	if (task_should_migrate(p, enq_flags) ||
+	    !is_cpu_idle(prev_cpu) ||
+	    (avoid_smt && is_smt_contended(prev_cpu)) ||
+	    (!is_pcpu_task(p) && (is_event_heavy(tctx) || !is_primary_cpu(prev_cpu)))) {
 		if (is_pcpu_task(p))
-			cpu = scx_bpf_test_and_clear_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY;
+			cpu = test_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY;
 		else
 			cpu = pick_idle_cpu(p, prev_cpu, -1, 0, true);
 		if (cpu >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(p), enq_flags);
+			if (is_event_heavy(tctx) && cpu != prev_cpu)
+				__sync_fetch_and_add(&nr_event_dispatches, 1);
+
 			if (cpu != prev_cpu || !scx_bpf_task_running(p))
-				wakeup_cpu(cpu);
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 			return;
 		}
 	}
 
 	/*
-	 * Keep using the same CPU if the system is not busy.
+	 * Keep using the same CPU if that CPU is not busy.
 	 */
-	if (!is_system_busy()) {
+	if (!is_cpu_busy(prev_cpu) &&
+	    (is_primary_cpu(prev_cpu) || is_pcpu_task(p))) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu, task_slice(p), enq_flags);
 		if (task_should_migrate(p, enq_flags))
-			wakeup_cpu(prev_cpu);
+			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 		return;
 	}
 
@@ -1289,7 +1232,46 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 				 task_slice(p), task_dl(p, tctx), enq_flags);
 
 	if (task_should_migrate(p, enq_flags))
-		wakeup_cpu(prev_cpu);
+		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+}
+
+/*
+ * Return true if the task can keep running on its current CPU from
+ * ops.dispatch(), false if the task should migrate.
+ */
+static bool keep_running(const struct task_struct *p, s32 cpu)
+{
+	const struct cpumask *mask = cast_mask(primary_cpumask);
+
+	/*
+	 * Do not keep running if the task doesn't need to run.
+	 */
+	if (!is_task_queued(p))
+		return false;
+
+	/*
+	* If the task can only run on this CPU, keep it running.
+	*/
+	if (is_pcpu_task(p))
+		return true;
+
+	/*
+	 * If the task is not running in a full-idle SMT core and there are
+	 * full-idle SMT cores available in the system, give it a chance to
+	 * migrate elsewhere.
+	 */
+	if (avoid_smt && is_smt_contended(cpu))
+		return false;
+
+	/*
+	 * If the task is not in the primary domain, give it a chance to
+	 * migrate.
+	 */
+	if (!is_primary_cpu(cpu) &&
+	    mask && bpf_cpumask_intersects(p->cpus_ptr, mask))
+		return false;
+
+	return true;
 }
 
 void BPF_STRUCT_OPS(cosmos_dispatch, s32 cpu, struct task_struct *prev)
@@ -1298,21 +1280,21 @@ void BPF_STRUCT_OPS(cosmos_dispatch, s32 cpu, struct task_struct *prev)
 	 * Check if the there's any task waiting in the shared DSQ and
 	 * dispatch.
 	 */
-	if (scx_bpf_dsq_move_to_local(shared_dsq(cpu)))
+	if (scx_bpf_dsq_move_to_local(shared_dsq(cpu), 0))
 		return;
 
 	/*
 	 * If the previous task expired its time slice, but no other task
-	 * wants to run on this SMT core, allow the previous task to run
-	 * for another time slot.
+	 * wants to run on this CPU, give it another time slot if the CPU
+	 * is on the primary domain.
 	 */
-	if (prev && (prev->scx.flags & SCX_TASK_QUEUED))
+	if (prev && keep_running(prev, cpu))
 		prev->scx.slice = task_slice(prev);
 }
 
 void BPF_STRUCT_OPS(cosmos_runnable, struct task_struct *p, u64 enq_flags)
 {
-	u64 now = scx_bpf_now(), delta_t;
+	u64 now = bpf_ktime_get_ns(), delta_t;
 	struct task_ctx *tctx;
 
 	tctx = try_lookup_task_ctx(p);
@@ -1348,7 +1330,7 @@ void BPF_STRUCT_OPS(cosmos_running, struct task_struct *p)
 	 * Save a timestamp when the task begins to run (used to evaluate
 	 * the used time slice).
 	 */
-	tctx->last_run_at = scx_bpf_now();
+	tctx->last_run_at = bpf_ktime_get_ns();
 
 	/*
 	 * Update current system's vruntime.
@@ -1366,6 +1348,17 @@ void BPF_STRUCT_OPS(cosmos_running, struct task_struct *p)
 	 */
 	if (perf_config || perf_sticky)
 		scx_pmu_event_start(p, false);
+}
+
+/*
+ * Return the time slice normalized by @cpu's capacity.
+ */
+static u64 scale_by_cpu_capacity(u64 slice, s32 cpu)
+{
+	if (all_cpus_same_capacity || !is_cpu_valid(cpu))
+		return slice;
+
+	return slice * cpu_capacity[cpu] / SCX_CPUPERF_ONE;
 }
 
 void BPF_STRUCT_OPS(cosmos_stopping, struct task_struct *p, bool runnable)
@@ -1387,7 +1380,13 @@ void BPF_STRUCT_OPS(cosmos_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * Evaluate the used time slice.
 	 */
-	slice = MIN(scx_bpf_now() - tctx->last_run_at, slice_ns);
+	slice = bpf_ktime_get_ns() - tctx->last_run_at;
+
+	/*
+	 * Scale used time slice by CPU capacity: time spent on slower CPU
+	 * is charged less time than running on faster CPU.
+	 */
+	slice = scale_by_cpu_capacity(slice, cpu);
 
 	/*
 	 * Update the vruntime and the total accumulated runtime since last
@@ -1472,8 +1471,6 @@ out_unlock:
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(cosmos_init)
 {
-	struct bpf_timer *timer;
-	u32 key = 0;
 	int err;
 	int cpu;
 	struct cpu_ctx *cctx;
@@ -1503,23 +1500,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cosmos_init)
 		err = scx_bpf_create_dsq(SHARED_DSQ, -1);
 		if (err) {
 			scx_bpf_error("failed to create shared DSQ: %d", err);
-			return err;
-		}
-	}
-
-	if (deferred_wakeups) {
-		timer = bpf_map_lookup_elem(&wakeup_timer, &key);
-		if (!timer) {
-			scx_bpf_error("Failed to lookup wakeup timer");
-			return -ESRCH;
-		}
-
-		bpf_timer_init(timer, &wakeup_timer, CLOCK_MONOTONIC);
-		bpf_timer_set_callback(timer, wakeup_timerfn);
-
-		err = bpf_timer_start(timer, slice_ns, 0);
-		if (err) {
-			scx_bpf_error("Failed to arm wakeup timer");
 			return err;
 		}
 	}

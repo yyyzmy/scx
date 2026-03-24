@@ -313,7 +313,7 @@ static bool dispatch_cpu(s32 cpu, bool from_dispatch)
 			break;
 		}
 
-		if (!__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL_ON | cpu, 0)) {
+		if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL_ON | cpu, 0)) {
 			bpf_task_release(p);
 			continue;
 		}
@@ -486,7 +486,7 @@ void BPF_STRUCT_OPS(tickless_dispatch, s32 cpu, struct task_struct *prev)
 	 * the shared DSQ after distributing them to the tickless CPUs,
 	 * primary CPUs will also start consuming them.
 	 */
-	if (scx_bpf_dsq_move_to_local(SHARED_DSQ)) {
+	if (scx_bpf_dsq_move_to_local(SHARED_DSQ, 0)) {
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 		return;
 	}

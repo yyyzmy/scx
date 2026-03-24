@@ -27,6 +27,7 @@ members = [
     "scheds/rust/scx_rustland",
     "scheds/rust/scx_rusty",
     "scheds/rust/scx_tickless",
+    "scheds/rust/scx_timely",
     "scheds/rust/scx_wd40",
     "tools/scxcash",
     "tools/scxtop",
@@ -51,3 +52,10 @@ inherits = "release"
 lto = false
 codegen-units = 32
 panic = "abort"
+
+[profile.ci]
+inherits = "dev"
+debug = 0
+incremental = false
+strip = true
+lto = false

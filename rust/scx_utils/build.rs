@@ -9,7 +9,6 @@ use std::io::{Read, Seek};
 use std::path::PathBuf;
 
 use scx_cargo::ClangInfo;
-use vergen::EmitBuilder;
 
 fn gen_bindings() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -65,12 +64,12 @@ fn gen_bindings() {
 fn main() {
     gen_bindings();
 
-    EmitBuilder::builder()
-        .git_sha(true)
-        .git_dirty(true)
-        .cargo_target_triple()
-        .emit()
-        .unwrap();
+    // Emit the target triple so build_id.rs can read it without vergen.
+    // This is stable across commits so it won't invalidate the cache.
+    println!(
+        "cargo:rustc-env=SCX_TARGET_TRIPLE={}",
+        env::var("TARGET").unwrap()
+    );
 
     let bindings = bindgen::Builder::default()
         .header("perf_wrapper.h")

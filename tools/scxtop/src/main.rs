@@ -468,12 +468,13 @@ fn run_trace(trace_args: &TraceArgs) -> Result<()> {
                         return 0;
                     }
 
-                    let data_slice = std::slice::from_raw_parts(data as *const u8, size as usize);
-
                     let mut event = bpf_event::default();
-                    if plain::copy_from_bytes(&mut event, data_slice).is_err() {
-                        return 0;
-                    }
+                    let copy_size = std::cmp::min(size as usize, std::mem::size_of::<bpf_event>());
+                    std::ptr::copy_nonoverlapping(
+                        data as *const u8,
+                        &mut event as *mut bpf_event as *mut u8,
+                        copy_size,
+                    );
 
                     // Drop events with invalid timestamps
                     if event.ts == 0 {
@@ -601,6 +602,22 @@ fn run_trace(trace_args: &TraceArgs) -> Result<()> {
             let trace_file = trace_args.output_file.clone();
             let mut trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
 
+            // Embed topology metadata in traces for cross-machine analysis
+            {
+                use scx_utils::Topology;
+                if let Ok(topo) = Topology::new() {
+                    let mut cpu_to_llc = std::collections::HashMap::new();
+                    let mut cpu_to_numa = std::collections::HashMap::new();
+                    let mut cpu_to_core = std::collections::HashMap::new();
+                    for cpu in topo.all_cpus.values() {
+                        cpu_to_llc.insert(cpu.id as u32, cpu.llc_id as u32);
+                        cpu_to_numa.insert(cpu.id as u32, cpu.node_id as u32);
+                        cpu_to_core.insert(cpu.id as u32, cpu.core_id as u32);
+                    }
+                    trace_manager.set_topology(cpu_to_llc, cpu_to_numa, cpu_to_core);
+                }
+            }
+
             info!("starting trace for {}ms", trace_args.trace_ms);
             trace_manager.start()?;
             let mut tracer = Tracer::new(skel);
@@ -616,17 +633,6 @@ fn run_trace(trace_args: &TraceArgs) -> Result<()> {
                         // Check shutdown flag to stop early if requested
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             if shutdown_trace.load(Ordering::Relaxed) {
-                                info!("trace task: shutdown requested, draining remaining events");
-                                // Drain remaining events in the channel
-                                while let Ok(a) = action_rx.try_recv() {
-                                    count += 1;
-                                    trace_manager
-                                        .on_action(&a)
-                                        .expect("Action should have been resolved");
-                                }
-                                info!("trace task: stopping trace manager");
-                                trace_manager.stop(trace_file, None).unwrap();
-                                info!("trace file compiled, collected {count} events");
                                 break;
                             }
                         }
@@ -640,16 +646,30 @@ fn run_trace(trace_args: &TraceArgs) -> Result<()> {
                                 trace_manager
                                     .on_action(&a)
                                     .expect("Action should have been resolved");
+                                // After processing, check shutdown to avoid
+                                // draining the entire buffered channel through
+                                // select! one event at a time.
+                                if shutdown_trace.load(Ordering::Relaxed) {
+                                    break;
+                                }
                             } else {
-                                info!("trace task: channel closed, stopping trace manager");
-                                trace_manager.stop(trace_file, None).unwrap();
-                                info!("trace file compiled, collected {count} events");
                                 break;
                             }
                         }
                     }
                 }
-                info!("trace task: exiting");
+                // Drain remaining events in a tight loop without select!
+                // overhead. This is much faster for large buffered channels.
+                info!("trace task: draining remaining events");
+                while let Ok(a) = action_rx.try_recv() {
+                    count += 1;
+                    trace_manager
+                        .on_action(&a)
+                        .expect("Action should have been resolved");
+                }
+                info!("trace task: stopping trace manager");
+                trace_manager.stop(trace_file, None).unwrap();
+                info!("trace file compiled, collected {count} events");
             });
 
             info!("waiting for trace duration ({}ms)", trace_args.trace_ms);
@@ -1064,12 +1084,13 @@ fn run_tui(tui_args: &TuiArgs) -> Result<()> {
                             return 0;
                         }
 
-                        let data_slice = std::slice::from_raw_parts(data as *const u8, size as usize);
-
                         let mut event = bpf_event::default();
-                        if plain::copy_from_bytes(&mut event, data_slice).is_err() {
-                            return 0;
-                        }
+                        let copy_size = std::cmp::min(size as usize, std::mem::size_of::<bpf_event>());
+                        std::ptr::copy_nonoverlapping(
+                            data as *const u8,
+                            &mut event as *mut bpf_event as *mut u8,
+                            copy_size,
+                        );
 
                         // Drop events with invalid timestamps
                         if event.ts == 0 {
@@ -1399,12 +1420,13 @@ fn run_mcp(mcp_args: &scxtop::cli::McpArgs) -> Result<()> {
                             return 0;
                         }
 
-                        let data_slice = std::slice::from_raw_parts(data as *const u8, size as usize);
-
                         let mut event = bpf_event::default();
-                        if plain::copy_from_bytes(&mut event, data_slice).is_err() {
-                            return 0;
-                        }
+                        let copy_size = std::cmp::min(size as usize, std::mem::size_of::<bpf_event>());
+                        std::ptr::copy_nonoverlapping(
+                            data as *const u8,
+                            &mut event as *mut bpf_event as *mut u8,
+                            copy_size,
+                        );
 
                         // Drop events with invalid timestamps
                         if event.ts == 0 {
@@ -1830,11 +1852,15 @@ fn run_mcp(mcp_args: &scxtop::cli::McpArgs) -> Result<()> {
             })
     } else {
         // One-shot mode: No BPF, just serve static data
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        let trace_cache = Arc::new(Mutex::new(HashMap::new()));
         let mut server = McpServer::new(mcp_config)
             .with_topology(topo_arc)
             .setup_scheduler_resource()
             .setup_profiling_resources()
             .with_stats_client(None)
+            .with_trace_cache(trace_cache)
             .setup_stats_resources();
         server.run_blocking()
     }
