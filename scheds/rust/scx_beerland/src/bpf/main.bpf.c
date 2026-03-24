@@ -212,9 +212,15 @@ static u64 calc_avg(u64 old_val, u64 new_val)
  */
 static u64 update_freq(u64 freq, u64 interval)
 {
-        u64 new_freq;
+	u64 new_freq;
 
-        new_freq = (100 * NSEC_PER_MSEC) / interval;
+	/*
+	 * Avoid a potential zero divisor. Two wakeups can share the same
+	 * ktime tick and yield interval==0, which verifier rejects.
+	 */
+	if (!interval)
+		interval = 1;
+	new_freq = (100 * NSEC_PER_MSEC) / interval;
         return calc_avg(freq, new_freq);
 }
 
