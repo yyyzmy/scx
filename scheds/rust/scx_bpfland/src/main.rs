@@ -11,22 +11,19 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
-use std::ffi::{c_int, c_ulong};
-use std::fmt::Write;
+use std::ffi::c_ulong;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::OpenObject;
-use libbpf_rs::ProgramInput;
 use log::warn;
 use log::{debug, info};
 use scx_stats::prelude::*;
@@ -41,70 +38,11 @@ use scx_utils::scx_ops_open;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
-use scx_utils::CoreType;
-use scx_utils::Cpumask;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
-use scx_utils::NR_CPU_IDS;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_bpfland";
-
-#[derive(PartialEq)]
-enum Powermode {
-    Turbo,
-    Performance,
-    Powersave,
-    Any,
-}
-
-fn get_primary_cpus(mode: Powermode) -> std::io::Result<Vec<usize>> {
-    let topo = Topology::new().unwrap();
-
-    let cpus: Vec<usize> = topo
-        .all_cores
-        .values()
-        .flat_map(|core| &core.cpus)
-        .filter_map(|(cpu_id, cpu)| match (&mode, &cpu.core_type) {
-            // Performance mode: add all the Big CPUs (either Turbo or non-Turbo)
-            (Powermode::Performance, CoreType::Big { .. }) |
-            // Powersave mode: add all the Little CPUs
-            (Powermode::Powersave, CoreType::Little) => Some(*cpu_id),
-            (Powermode::Any, ..) => Some(*cpu_id),
-            _ => None,
-        })
-        .collect();
-
-    Ok(cpus)
-}
-
-// Convert an array of CPUs to the corresponding cpumask of any arbitrary size.
-fn cpus_to_cpumask(cpus: &Vec<usize>) -> String {
-    if cpus.is_empty() {
-        return String::from("none");
-    }
-
-    // Determine the maximum CPU ID to create a sufficiently large byte vector.
-    let max_cpu_id = *cpus.iter().max().unwrap();
-
-    // Create a byte vector with enough bytes to cover all CPU IDs.
-    let mut bitmask = vec![0u8; (max_cpu_id + 1 + 7) / 8];
-
-    // Set the appropriate bits for each CPU ID.
-    for cpu_id in cpus {
-        let byte_index = cpu_id / 8;
-        let bit_index = cpu_id % 8;
-        bitmask[byte_index] |= 1 << bit_index;
-    }
-
-    // Convert the byte vector to a hexadecimal string.
-    let hex_str: String = bitmask.iter().rev().fold(String::new(), |mut f, byte| {
-        let _ = write!(&mut f, "{:02x}", byte);
-        f
-    });
-
-    format!("0x{}", hex_str)
-}
 
 /// scx_bpfland: a vruntime-based sched_ext scheduler that prioritizes interactive workloads.
 ///
@@ -285,22 +223,16 @@ impl<'a> Scheduler<'a> {
             info!("Disabling NUMA optimizations");
         }
 
-        // Determine the primary scheduling domain.
         let power_profile = Self::power_profile();
-        let domain =
-            Self::resolve_energy_domain(&opts.primary_domain, power_profile).map_err(|err| {
-                anyhow!(
-                    "failed to resolve primary domain '{}': {}",
-                    &opts.primary_domain,
-                    err
-                )
-            })?;
 
         info!(
             "{} {} {}",
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION")),
             if smt_enabled { "SMT on" } else { "SMT off" }
+        );
+        info!(
+            "BPF load compatibility: primary domain=all CPUs; SMT sibling masks not programmed from userspace"
         );
 
         // Print command line.
@@ -334,7 +266,8 @@ impl<'a> Scheduler<'a> {
         // Override default BPF scheduling parameters.
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.debug = opts.debug;
-        rodata.smt_enabled = smt_enabled;
+        /* Avoid syscall-type BPF programs + test_run(); see scx_beerland compat path. */
+        rodata.smt_enabled = false;
         rodata.numa_enabled = numa_enabled;
         rodata.local_pcpu = opts.local_pcpu;
         rodata.no_wake_sync = opts.no_wake_sync;
@@ -343,7 +276,7 @@ impl<'a> Scheduler<'a> {
         rodata.slice_min = opts.slice_min_us * 1000;
         rodata.slice_lag = opts.slice_us_lag * 1000;
         rodata.throttle_ns = opts.throttle_us * 1000;
-        rodata.primary_all = domain.weight() == *NR_CPU_IDS;
+        rodata.primary_all = true;
 
         // Generate the list of available CPUs sorted by capacity in descending order.
         let mut cpus: Vec<_> = topo.all_cpus.values().collect();
@@ -382,26 +315,12 @@ impl<'a> Scheduler<'a> {
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, bpfland_ops, uei)?;
 
-        // Initialize the primary scheduling domain.
-        Self::init_energy_domain(&mut skel, &domain).map_err(|err| {
-            anyhow!(
-                "failed to initialize primary domain 0x{:x}: {}",
-                domain,
-                err
-            )
-        })?;
-
         // Initialize CPU frequency scaling.
         if let Err(err) = Self::init_cpufreq_perf(&mut skel, &opts.primary_domain, opts.cpufreq) {
             bail!(
                 "failed to initialize cpufreq performance level: error {}",
                 err
             );
-        }
-
-        // Initialize SMT domains.
-        if smt_enabled {
-            Self::init_smt_domains(&mut skel, &topo)?;
         }
 
         // Attach the scheduler.
@@ -417,74 +336,6 @@ impl<'a> Scheduler<'a> {
             stats_server,
             user_restart: false,
         })
-    }
-
-    fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
-        let prog = &mut skel.progs.enable_primary_cpu;
-        let mut args = cpu_arg {
-            cpu_id: cpu as c_int,
-        };
-        let input = ProgramInput {
-            context_in: Some(unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut args as *mut _ as *mut u8,
-                    std::mem::size_of_val(&args),
-                )
-            }),
-            ..Default::default()
-        };
-        let out = prog.test_run(input).unwrap();
-        if out.return_value != 0 {
-            return Err(out.return_value);
-        }
-
-        Ok(())
-    }
-
-    fn epp_to_cpumask(profile: Powermode) -> Result<Cpumask> {
-        let mut cpus = get_primary_cpus(profile).unwrap_or_default();
-        if cpus.is_empty() {
-            cpus = get_primary_cpus(Powermode::Any).unwrap_or_default();
-        }
-        Cpumask::from_str(&cpus_to_cpumask(&cpus))
-    }
-
-    fn resolve_energy_domain(primary_domain: &str, power_profile: PowerProfile) -> Result<Cpumask> {
-        let domain = match primary_domain {
-            "powersave" => Self::epp_to_cpumask(Powermode::Powersave)?,
-            "performance" => Self::epp_to_cpumask(Powermode::Performance)?,
-            "turbo" => Self::epp_to_cpumask(Powermode::Turbo)?,
-            "auto" => match power_profile {
-                PowerProfile::Powersave => Self::epp_to_cpumask(Powermode::Powersave)?,
-                PowerProfile::Balanced { .. }
-                | PowerProfile::Performance
-                | PowerProfile::Unknown => Self::epp_to_cpumask(Powermode::Any)?,
-            },
-            "all" => Self::epp_to_cpumask(Powermode::Any)?,
-            &_ => Cpumask::from_str(primary_domain)?,
-        };
-
-        Ok(domain)
-    }
-
-    fn init_energy_domain(skel: &mut BpfSkel<'_>, domain: &Cpumask) -> Result<()> {
-        info!("primary CPU domain = 0x{:x}", domain);
-
-        // Clear the primary domain by passing a negative CPU id.
-        if let Err(err) = Self::enable_primary_cpu(skel, -1) {
-            bail!("failed to reset primary domain: error {}", err);
-        }
-
-        // Update primary scheduling domain.
-        for cpu in 0..*NR_CPU_IDS {
-            if domain.test_cpu(cpu) {
-                if let Err(err) = Self::enable_primary_cpu(skel, cpu as i32) {
-                    bail!("failed to add CPU {} to primary domain: error {}", cpu, err);
-                }
-            }
-        }
-
-        Ok(())
     }
 
     // Update hint for the cpufreq governor.
@@ -543,44 +394,6 @@ impl<'a> Scheduler<'a> {
         }
 
         false
-    }
-
-    fn enable_sibling_cpu(
-        skel: &mut BpfSkel<'_>,
-        cpu: usize,
-        sibling_cpu: usize,
-    ) -> Result<(), u32> {
-        let prog = &mut skel.progs.enable_sibling_cpu;
-        let mut args = domain_arg {
-            cpu_id: cpu as c_int,
-            sibling_cpu_id: sibling_cpu as c_int,
-        };
-        let input = ProgramInput {
-            context_in: Some(unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut args as *mut _ as *mut u8,
-                    std::mem::size_of_val(&args),
-                )
-            }),
-            ..Default::default()
-        };
-        let out = prog.test_run(input).unwrap();
-        if out.return_value != 0 {
-            return Err(out.return_value);
-        }
-
-        Ok(())
-    }
-
-    fn init_smt_domains(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<(), std::io::Error> {
-        let smt_siblings = topo.sibling_cpus();
-
-        info!("SMT sibling CPUs: {:?}", smt_siblings);
-        for (cpu, sibling_cpu) in smt_siblings.iter().enumerate() {
-            Self::enable_sibling_cpu(skel, cpu, *sibling_cpu as usize).unwrap();
-        }
-
-        Ok(())
     }
 
     fn get_metrics(&self) -> Metrics {

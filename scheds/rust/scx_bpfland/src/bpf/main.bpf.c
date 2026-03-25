@@ -799,10 +799,13 @@ static u64 calc_avg(u64 old_val, u64 new_val)
  */
 static u64 update_freq(u64 freq, u64 interval)
 {
-        u64 new_freq;
+	u64 new_freq;
 
-        new_freq = (100 * NSEC_PER_MSEC) / interval;
-        return calc_avg(freq, new_freq);
+	/* Avoid zero divisor: same ktime tick can yield interval==0; verifier rejects. */
+	if (!interval)
+		interval = 1;
+	new_freq = (100 * NSEC_PER_MSEC) / interval;
+	return calc_avg(freq, new_freq);
 }
 
 /*
@@ -1185,8 +1188,7 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 	return err;
 }
 
-SEC("syscall")
-int enable_sibling_cpu(struct domain_arg *input)
+static int enable_sibling_cpu(struct domain_arg *input)
 {
 	struct cpu_ctx *cctx;
 	struct bpf_cpumask *mask, **pmask;
@@ -1210,8 +1212,7 @@ int enable_sibling_cpu(struct domain_arg *input)
 	return err;
 }
 
-SEC("syscall")
-int enable_primary_cpu(struct cpu_arg *input)
+static int enable_primary_cpu(struct cpu_arg *input)
 {
 	struct bpf_cpumask *mask;
 	int err = 0;
