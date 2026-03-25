@@ -995,10 +995,9 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	cctx->perf_lvl = perf_lvl;
 
 	/*
-	 * Refresh the dynamic cpuperf scaling factor if needed.
+	 * scx_bpf_cpuperf_set() is __weak; omit to match kernels without
+	 * sched_ext cpufreq kfuncs (avoids BPF load failure).
 	 */
-	if (cpufreq_perf_lvl < 0)
-		scx_bpf_cpuperf_set(cpu, cctx->perf_lvl);
 
 	cctx->last_running = now;
 	cctx->prev_runtime = cctx->tot_runtime;
@@ -1121,17 +1120,25 @@ s32 BPF_STRUCT_OPS(bpfland_init_task, struct task_struct *p,
 
 /*
  * Evaluate the amount of online CPUs.
+ *
+ * scx_bpf_get_online_cpumask() is __weak; fall back to possible CPU count
+ * when the ksym is absent (otherwise BPF load can fail on some kernels).
  */
-static s32 get_nr_online_cpus(void)
+static u64 get_nr_online_cpus(void)
 {
 	const struct cpumask *online_cpumask;
-	int cpus;
+	u64 n;
+
+	if (!bpf_ksym_exists(scx_bpf_get_online_cpumask))
+		return 0; /* caller uses nr_cpu_ids fallback */
 
 	online_cpumask = scx_bpf_get_online_cpumask();
-	cpus = bpf_cpumask_weight(online_cpumask);
-	scx_bpf_put_cpumask(online_cpumask);
+	if (!online_cpumask)
+		return 0;
 
-	return cpus;
+	n = (u64)bpf_cpumask_weight(online_cpumask);
+	scx_bpf_put_cpumask(online_cpumask);
+	return n;
 }
 
 static int init_cpumask(struct bpf_cpumask **cpumask)
@@ -1211,36 +1218,27 @@ static int enable_primary_cpu(struct cpu_arg *input)
 }
 
 /*
- * Initialize cpufreq performance level on all the online CPUs.
+ * Optional initial cpufreq programming via scx_bpf_cpuperf_set() was removed
+ * for load compatibility (weak kfunc). Userspace -f / power profile hints
+ * remain in rodata/bss only.
  */
 static void init_cpuperf_target(void)
 {
-	const struct cpumask *online_cpumask;
-	u64 perf_lvl;
-	s32 cpu;
-
-	online_cpumask = scx_bpf_get_online_cpumask();
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (!bpf_cpumask_test_cpu(cpu, online_cpumask))
-			continue;
-
-		/* Set the initial cpufreq performance level  */
-		if (cpufreq_perf_lvl < 0)
-			perf_lvl = SCX_CPUPERF_ONE;
-		else
-			perf_lvl = MIN(cpufreq_perf_lvl, SCX_CPUPERF_ONE);
-		scx_bpf_cpuperf_set(cpu, perf_lvl);
-	}
-	scx_bpf_put_cpumask(online_cpumask);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 {
 	int err, i;
+	u64 n_online;
 
-	/* Initialize amount of online and possible CPUs */
-	nr_online_cpus = get_nr_online_cpus();
+	/* Possible CPUs first — used as fallback for online count. */
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
+
+	n_online = get_nr_online_cpus();
+	if (n_online)
+		nr_online_cpus = n_online;
+	else
+		nr_online_cpus = nr_cpu_ids;
 
 	/* Initialize CPUs and NUMA properties */
 	init_cpuperf_target();

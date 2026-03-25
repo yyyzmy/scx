@@ -232,7 +232,7 @@ impl<'a> Scheduler<'a> {
             if smt_enabled { "SMT on" } else { "SMT off" }
         );
         info!(
-            "BPF load compatibility: primary domain=all CPUs; SMT sibling masks not programmed from userspace"
+            "BPF load compatibility: primary domain=all CPUs; SMT masks not programmed; no bpf_timer; weak kfuncs (cpufreq/online mask) avoided where needed"
         );
         if opts.throttle_us > 0 {
             warn!(
