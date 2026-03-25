@@ -112,6 +112,12 @@ const volatile u64 preferred_cpus[MAX_CPUS];
 const volatile u64 cpu_capacity[MAX_CPUS];
 
 /*
+ * Verifier-safe index for @cpu_capacity (must use constant MAX_CPUS, not
+ * nr_cpu_ids — see is_cpu_faster and kernel verifier "unbounded memory access").
+ */
+#define CPU_IDX_OK(__c) ((__c) >= 0 && (__c) < MAX_CPUS)
+
+/*
  * Scheduling statistics.
  */
 volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
@@ -342,13 +348,20 @@ static inline bool cpus_share_cache(s32 this_cpu, s32 that_cpu)
 
 /*
  * Return true if @this_cpu is faster than @that_cpu, false otherwise.
+ *
+ * noinline: keeps verifier state simpler when called from select_cpu (some
+ * kernels lose bounds on inlined cpu_capacity[] access).
  */
-static inline bool is_cpu_faster(s32 this_cpu, s32 that_cpu)
+static __noinline bool is_cpu_faster(s32 this_cpu, s32 that_cpu)
 {
         if (this_cpu == that_cpu)
                 return false;
 
-	if (!is_cpu_valid(this_cpu) || !is_cpu_valid(that_cpu))
+	/*
+	 * Must bound against MAX_CPUS before indexing cpu_capacity[]; using
+	 * is_cpu_valid() (nr_cpu_ids) alone does not satisfy some verifiers.
+	 */
+	if (!CPU_IDX_OK(this_cpu) || !CPU_IDX_OK(that_cpu))
 		return false;
 
 	return cpu_capacity[this_cpu] > cpu_capacity[that_cpu];
