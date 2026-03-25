@@ -132,22 +132,11 @@ volatile u64 nr_online_cpus;
 static u64 nr_cpu_ids;
 
 /*
- * Runtime throttling.
- *
- * Throttle the CPUs by injecting @throttle_ns idle time every @slice_max.
+ * Requested throttle interval (see -t).  BPF duty-cycle throttling used a
+ * bpf_timer map which breaks loading on some kernels; throttling is ignored
+ * in this build (always off).
  */
-const volatile u64 throttle_ns;
-static volatile bool cpus_throttled;
-
-static inline bool is_throttled(void)
-{
-	return READ_ONCE(cpus_throttled);
-}
-
-static inline void set_throttled(bool state)
-{
-	WRITE_ONCE(cpus_throttled, state);
-}
+const volatile u64 throttle_ns __maybe_unused;
 
 /*
  * Exit information.
@@ -177,20 +166,6 @@ const volatile bool numa_enabled = true;
  * Current global vruntime.
  */
 static u64 vtime_now;
-
-/*
- * Timer used to inject idle cycles when CPU throttling is enabled.
- */
-struct throttle_timer {
-	struct bpf_timer timer;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, u32);
-	__type(value, struct throttle_timer);
-} throttle_timer SEC(".maps");
 
 /*
  * Per-CPU context.
@@ -964,12 +939,6 @@ void BPF_STRUCT_OPS(bpfland_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(node_dsq(cpu));
 
 	/*
-	 * Let the CPU go idle if the system is throttled.
-	 */
-	if (is_throttled())
-		return;
-
-	/*
 	 * Try to consume the first task either from the per-CPU DSQ or the
 	 * per-node DSQ, picking the one with the minimum deadline that can
 	 * run on @cpu.
@@ -1265,55 +1234,9 @@ static void init_cpuperf_target(void)
 	scx_bpf_put_cpumask(online_cpumask);
 }
 
-/*
- * Throttle timer used to inject idle time across all the CPUs.
- */
-static int throttle_timerfn(void *map, int *key, struct bpf_timer *timer)
-{
-	bool throttled = is_throttled();
-	u64 flags, duration;
-	s32 cpu;
-	int err;
-
-	/*
-	 * Stop the CPUs sending a preemption IPI (SCX_KICK_PREEMPT) if we
-	 * need to interrupt the running tasks and inject the idle sleep.
-	 *
-	 * Otherwise, send a wakeup IPI to resume from the injected idle
-	 * sleep.
-	 */
-	if (throttled) {
-		flags = SCX_KICK_IDLE;
-		duration = slice_max;
-	} else {
-		flags = SCX_KICK_PREEMPT;
-		duration = throttle_ns;
-	}
-
-	/*
-	 * Flip the throttled state.
-	 */
-	set_throttled(!throttled);
-
-	bpf_for(cpu, 0, nr_cpu_ids)
-		scx_bpf_kick_cpu(cpu, flags);
-
-	/*
-	 * Re-arm the duty-cycle timer setting the runtime or the idle time
-	 * duration.
-	 */
-	err = bpf_timer_start(timer, duration, 0);
-	if (err)
-		scx_bpf_error("Failed to re-arm duty cycle timer");
-
-	return 0;
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 {
-	struct bpf_timer *timer;
 	int err, i;
-	u32 key = 0;
 
 	/* Initialize amount of online and possible CPUs */
 	nr_online_cpus = get_nr_online_cpus();
@@ -1353,25 +1276,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 	err = init_cpumask(&primary_cpumask);
 	if (err)
 		return err;
-
-	timer = bpf_map_lookup_elem(&throttle_timer, &key);
-	if (!timer) {
-		scx_bpf_error("Failed to lookup throttle timer");
-		return -ESRCH;
-	}
-
-	/*
-	 * Fire the throttle timer if CPU throttling is enabled.
-	 */
-	if (throttle_ns) {
-		bpf_timer_init(timer, &throttle_timer, CLOCK_BOOTTIME);
-		bpf_timer_set_callback(timer, throttle_timerfn);
-		err = bpf_timer_start(timer, slice_max, 0);
-		if (err) {
-			scx_bpf_error("Failed to arm throttle timer");
-			return err;
-		}
-	}
 
 	return 0;
 }

@@ -234,6 +234,11 @@ impl<'a> Scheduler<'a> {
         info!(
             "BPF load compatibility: primary domain=all CPUs; SMT sibling masks not programmed from userspace"
         );
+        if opts.throttle_us > 0 {
+            warn!(
+                "CPU throttling (-t) is disabled in this BPF build (bpf_timer removed for load compatibility); ignoring"
+            );
+        }
 
         // Print command line.
         info!(
@@ -293,9 +298,8 @@ impl<'a> Scheduler<'a> {
         }
         rodata.preferred_idle_scan = opts.preferred_idle_scan;
 
-        // Implicitly enable direct dispatch of per-CPU kthreads if CPU throttling is enabled
-        // (it's never a good idea to throttle per-CPU kthreads).
-        rodata.local_kthreads = opts.local_kthreads || opts.throttle_us > 0;
+        // Direct dispatch for kthreads (optional; no longer tied to -t after bpf_timer removal).
+        rodata.local_kthreads = opts.local_kthreads;
 
         // Set scheduler flags.
         skel.struct_ops.bpfland_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
