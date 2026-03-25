@@ -1131,29 +1131,6 @@ s32 BPF_STRUCT_OPS(bpfland_init_task, struct task_struct *p,
 	return 0;
 }
 
-/*
- * Evaluate the amount of online CPUs.
- *
- * scx_bpf_get_online_cpumask() is __weak; fall back to possible CPU count
- * when the ksym is absent (otherwise BPF load can fail on some kernels).
- */
-static u64 get_nr_online_cpus(void)
-{
-	const struct cpumask *online_cpumask;
-	u64 n;
-
-	if (!bpf_ksym_exists(scx_bpf_get_online_cpumask))
-		return 0; /* caller uses nr_cpu_ids fallback */
-
-	online_cpumask = scx_bpf_get_online_cpumask();
-	if (!online_cpumask)
-		return 0;
-
-	n = (u64)bpf_cpumask_weight(online_cpumask);
-	scx_bpf_put_cpumask(online_cpumask);
-	return n;
-}
-
 static int init_cpumask(struct bpf_cpumask **cpumask)
 {
 	struct bpf_cpumask *mask;
@@ -1242,16 +1219,14 @@ static void init_cpuperf_target(void)
 s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 {
 	int err, i;
-	u64 n_online;
 
-	/* Possible CPUs first — used as fallback for online count. */
+	/*
+	 * Sleepable struct_ops .init cannot call bpf_cpumask_weight() (verifier:
+	 * "calling kernel function bpf_cpumask_weight is not allowed"). Use
+	 * possible CPU count as the online stats hint (same order of magnitude).
+	 */
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
-
-	n_online = get_nr_online_cpus();
-	if (n_online)
-		nr_online_cpus = n_online;
-	else
-		nr_online_cpus = nr_cpu_ids;
+	nr_online_cpus = nr_cpu_ids;
 
 	/* Initialize CPUs and NUMA properties */
 	init_cpuperf_target();
