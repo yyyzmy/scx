@@ -15,6 +15,14 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* Some schedulers rely on these time constants; ensure they exist here too. */
+#ifndef NSEC_PER_USEC
+#define NSEC_PER_USEC 1000ULL
+#endif
+#ifndef NSEC_PER_MSEC
+#define NSEC_PER_MSEC (1000ULL * NSEC_PER_USEC)
+#endif
+
 /*
  * A single global DSQ (priority queue). The dispatch callback moves the
  * best task to the local DSQ of the current CPU.
@@ -195,7 +203,8 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	/* scx_bpf_dsq_move_to_local(dsq_id, enq_flags) */
+	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 }
 
 /*
