@@ -24,10 +24,20 @@ char _license[] SEC("license") = "GPL";
 #endif
 
 /*
- * A single global DSQ (priority queue). The dispatch callback moves the
- * best task to the local DSQ of the current CPU.
+ * Two-level queueing for short-task-dense workloads:
+ *  - per-CPU DSQ: first-choice for short bursts (improves cache locality and
+ *    reduces global queue contention)
+ *  - shared DSQ: fallback and long-task queue
  */
 #define SHARED_DSQ 0
+#define CPU_DSQ_BASE 1
+#define MAX_CPUS 4096
+static u64 nr_cpu_ids;
+
+static __always_inline u64 cpu_dsq_id(s32 cpu)
+{
+	return (u64)CPU_DSQ_BASE + (u64)cpu;
+}
 
 /* EWMA parameters: new_avg = old*0.75 + new*0.25 */
 static __always_inline u64 calc_avg(u64 old_val, u64 new_val)
@@ -56,9 +66,10 @@ static u64 vtime_now;
 
 UEI_DEFINE(uei);
 
-/* Tunables: aging and maximum estimated remaining time. */
+/* Tunables: aging and short-task thresholds. */
 #define AGING_DIV 8ULL
 #define MAX_REM_EST_NS (200ULL * NSEC_PER_MSEC)
+#define SHORT_TASK_NS (80ULL * NSEC_PER_USEC)
 
 static __always_inline struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 {
@@ -89,11 +100,22 @@ s32 BPF_STRUCT_OPS(kp_init_task, struct task_struct *p, struct scx_init_task_arg
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(kp_init)
 {
-	int err;
+	int err, cpu;
 
 	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
 	if (err)
 		return err;
+
+	nr_cpu_ids = scx_bpf_nr_cpu_ids();
+	if (nr_cpu_ids > MAX_CPUS)
+		nr_cpu_ids = MAX_CPUS;
+
+	/* Create per-CPU DSQs to increase parallel enqueue/dequeue capacity. */
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		err = scx_bpf_create_dsq(cpu_dsq_id(cpu), __COMPAT_scx_bpf_cpu_node(cpu));
+		if (err)
+			return err;
+	}
 
 	vtime_now = 0;
 
@@ -174,6 +196,8 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	u64 now, rem_est, wait, aging, rem_est_adj, deadline;
+	s32 prev_cpu;
+	bool is_short;
 
 	if (!tctx)
 		return;
@@ -194,6 +218,30 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 		rem_est_adj = MAX_REM_EST_NS;
 
 	deadline = vtime_now + scale_by_task_weight_inverse(p, rem_est_adj);
+	is_short = rem_est_adj <= SHORT_TASK_NS;
+
+	/*
+	 * Short-burst tasks prefer per-CPU DSQs to reduce global queue
+	 * contention and improve locality. Long(er) tasks go through the
+	 * shared queue.
+	 */
+	if (is_short) {
+		prev_cpu = scx_bpf_task_cpu(p);
+		if (prev_cpu < 0 || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+			prev_cpu = bpf_cpumask_first(p->cpus_ptr);
+		if (prev_cpu >= 0 && (u64)prev_cpu < nr_cpu_ids) {
+			scx_bpf_dsq_insert_vtime(
+				p,
+				cpu_dsq_id(prev_cpu),
+				SCX_SLICE_DFL,
+				deadline,
+				enq_flags
+			);
+			if (!__COMPAT_is_enq_cpu_selected(enq_flags))
+				scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+			return;
+		}
+	}
 
 	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, deadline, enq_flags);
 }
@@ -203,8 +251,23 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 {
-	/* scx_bpf_dsq_move_to_local(dsq_id, enq_flags) */
-	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
+	u64 src;
+
+	/* 1) Own per-CPU queue first. */
+	if ((u64)cpu < nr_cpu_ids && scx_bpf_dsq_move_to_local(cpu_dsq_id(cpu), 0))
+		return;
+
+	/* 2) Then shared queue. */
+	if (scx_bpf_dsq_move_to_local(SHARED_DSQ, 0))
+		return;
+
+	/* 3) Lightweight steal from other per-CPU queues. */
+	bpf_for(src, 0, nr_cpu_ids) {
+		if ((s32)src == cpu)
+			continue;
+		if (scx_bpf_dsq_move_to_local(cpu_dsq_id((s32)src), 0))
+			return;
+	}
 }
 
 /*
