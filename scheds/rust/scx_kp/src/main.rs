@@ -61,9 +61,9 @@ impl<'a> Scheduler<'a> {
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
-        let mut skel = scx_ops_open!(skel_builder, open_object, beerland_ops, open_opts)?;
-        let mut skel = scx_ops_load!(skel, beerland_ops, uei)?;
-        let struct_ops = Some(scx_ops_attach!(skel, beerland_ops)?);
+        let mut skel = scx_ops_open!(skel_builder, open_object, kp_ops, open_opts)?;
+        let mut skel = scx_ops_load!(skel, kp_ops, uei)?;
+        let struct_ops = Some(scx_ops_attach!(skel, kp_ops)?);
 
         Ok(Self { skel, struct_ops })
     }

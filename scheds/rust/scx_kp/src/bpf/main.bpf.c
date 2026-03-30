@@ -1,7 +1,225 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_kp v0 baseline:
- * reuse scx_beerland BPF scheduling core as the starting point.
- * Subsequent iterations will add Kunpeng-specific LLC-aware classification.
+ * scx_kp: Short-task dense scheduler (independent implementation).
+ *
+ * Goal: improve throughput and turnaround time in short-burst intensive
+ * workloads by using a cheap SRPT-like priority:
+ *   - Maintain per-task avg_runtime via EWMA (updated on stopping).
+ *   - Maintain per-task last_stop timestamp.
+ *   - On enqueue, compute:
+ *       rem_est_adj = clamp(avg_runtime + aging(wait), MAX_REM_EST)
+ *       deadline_vtime = vtime_now + scale_by_task_weight_inverse(rem_est_adj)
+ *     and insert into a global DSQ using deadline_vtime ordering.
  */
-#include "../../../scx_beerland/src/bpf/main.bpf.c"
+#include <scx/common.bpf.h>
+
+char _license[] SEC("license") = "GPL";
+
+/*
+ * A single global DSQ (priority queue). The dispatch callback moves the
+ * best task to the local DSQ of the current CPU.
+ */
+#define SHARED_DSQ 0
+
+/* EWMA parameters: new_avg = old*0.75 + new*0.25 */
+static __always_inline u64 calc_avg(u64 old_val, u64 new_val)
+{
+	return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+struct task_ctx {
+	u64 last_run_at;
+	u64 last_stop_at;
+	u64 avg_runtime;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct task_ctx);
+} task_ctx_stor SEC(".maps");
+
+/*
+ * Global vtime baseline used for DSQ vtime accounting.
+ * Updated on ops.running.
+ */
+static u64 vtime_now;
+
+UEI_DEFINE(uei);
+
+/* Tunables: aging and maximum estimated remaining time. */
+#define AGING_DIV 8ULL
+#define MAX_REM_EST_NS (200ULL * NSEC_PER_MSEC)
+
+static __always_inline struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
+{
+	return bpf_task_storage_get(&task_ctx_stor, (struct task_struct *)p, 0, 0);
+}
+
+static __always_inline struct task_ctx *get_or_create_task_ctx(struct task_struct *p)
+{
+	return bpf_task_storage_get(&task_ctx_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+}
+
+/*
+ * Ensure per-task state exists and initialize.
+ */
+s32 BPF_STRUCT_OPS(kp_init_task, struct task_struct *p, struct scx_init_task_args *args)
+{
+	struct task_ctx *tctx = get_or_create_task_ctx(p);
+
+	if (!tctx)
+		return -ENOMEM;
+
+	/* Initialize to a reasonable default so the first enqueue has a rem_est. */
+	if (!tctx->avg_runtime)
+		tctx->avg_runtime = SCX_SLICE_DFL;
+
+	return 0;
+}
+
+s32 BPF_STRUCT_OPS_SLEEPABLE(kp_init)
+{
+	int err;
+
+	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (err)
+		return err;
+
+	vtime_now = 0;
+
+	return 0;
+}
+
+/*
+ * Pick a CPU: prefer last cpu if it's idle, otherwise fall back to default.
+ */
+s32 BPF_STRUCT_OPS(kp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+	bool is_idle = false;
+	s32 cpu;
+
+	/* Ensure prev_cpu is usable for this task. */
+	if (prev_cpu < 0 || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		prev_cpu = bpf_cpumask_first(p->cpus_ptr);
+
+	if (prev_cpu >= 0 && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		return prev_cpu;
+
+	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+
+	return cpu;
+}
+
+/*
+ * Update last stop timestamp and avg_runtime (EWMA) when the task leaves CPU.
+ */
+void BPF_STRUCT_OPS(kp_stopping, struct task_struct *p, bool runnable)
+{
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	u64 now, slice;
+
+	if (!tctx)
+		return;
+
+	now = bpf_ktime_get_ns();
+	slice = now - tctx->last_run_at;
+
+	/* Update avg burst length. */
+	tctx->avg_runtime = calc_avg(tctx->avg_runtime, slice);
+	tctx->last_stop_at = now;
+
+	/*
+	 * Keep scx_simple-style vtime accounting so vtime_now can advance and
+	 * dsq_vtime comparisons remain meaningful.
+	 */
+	p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+}
+
+/*
+ * Record run start time and advance vtime baseline.
+ */
+void BPF_STRUCT_OPS(kp_running, struct task_struct *p)
+{
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+	if (!tctx)
+		return;
+
+	tctx->last_run_at = bpf_ktime_get_ns();
+
+	if (time_before(vtime_now, p->scx.dsq_vtime))
+		vtime_now = p->scx.dsq_vtime;
+}
+
+void BPF_STRUCT_OPS(kp_enable, struct task_struct *p)
+{
+	p->scx.dsq_vtime = vtime_now;
+}
+
+/*
+ * Enqueue: compute an SRPT-like "predicted remaining" and use it as
+ * ordering key via DSQ insert_vtime().
+ */
+void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	u64 now, rem_est, wait, aging, rem_est_adj, deadline;
+
+	if (!tctx)
+		return;
+
+	now = bpf_ktime_get_ns();
+
+	rem_est = tctx->avg_runtime;
+	if (!rem_est)
+		rem_est = SCX_SLICE_DFL;
+
+	/* Aging: older tasks get effectively larger rem_est to avoid starvation. */
+	wait = tctx->last_stop_at ? (now - tctx->last_stop_at) : 0;
+	aging = wait / AGING_DIV;
+	rem_est_adj = rem_est + aging;
+
+	/* Clamp rem_est_adj to keep arithmetic bounded for verifier. */
+	if (rem_est_adj > MAX_REM_EST_NS)
+		rem_est_adj = MAX_REM_EST_NS;
+
+	deadline = vtime_now + scale_by_task_weight_inverse(p, rem_est_adj);
+
+	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, deadline, enq_flags);
+}
+
+/*
+ * Dispatch: move best task from shared DSQ to local DSQ for this CPU.
+ */
+void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
+{
+	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+}
+
+/*
+ * Runnable hook is not needed here: we use enqueue/stopping for burst
+ * estimation and aging, keeping the ops set smaller.
+ */
+
+/*
+ * Scheduler exit callback.
+ */
+void BPF_STRUCT_OPS(kp_exit, struct scx_exit_info *ei)
+{
+	UEI_RECORD(uei, ei);
+}
+
+SCX_OPS_DEFINE(kp_ops,
+	       .select_cpu		= (void *)kp_select_cpu,
+	       .enqueue			= (void *)kp_enqueue,
+	       .dispatch		= (void *)kp_dispatch,
+	       .running			= (void *)kp_running,
+	       .stopping		= (void *)kp_stopping,
+	       .enable			= (void *)kp_enable,
+	       .init_task		= (void *)kp_init_task,
+	       .init			= (void *)kp_init,
+	       .exit			= (void *)kp_exit,
+	       .timeout_ms		= 5000,
+	       .name			= "kp");
