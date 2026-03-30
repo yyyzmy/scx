@@ -66,10 +66,10 @@ static u64 vtime_now;
 
 UEI_DEFINE(uei);
 
-/* Tunables: aging and short-task thresholds. */
-#define AGING_DIV 8ULL
-#define MAX_REM_EST_NS (200ULL * NSEC_PER_MSEC)
-#define SHORT_TASK_NS (80ULL * NSEC_PER_USEC)
+/* Tunables (runtime configurable from userspace via rodata). */
+const volatile u64 kp_aging_div = 8ULL;
+const volatile u64 kp_max_rem_est_ns = 200ULL * NSEC_PER_MSEC;
+const volatile u64 kp_short_task_ns = 80ULL * NSEC_PER_USEC;
 
 static __always_inline struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 {
@@ -196,6 +196,7 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 	u64 now, rem_est, wait, aging, rem_est_adj, deadline;
+	u64 aging_div, max_rem_est_ns, short_task_ns;
 	s32 prev_cpu;
 	bool is_short;
 
@@ -210,15 +211,19 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/* Aging: older tasks get effectively larger rem_est to avoid starvation. */
 	wait = tctx->last_stop_at ? (now - tctx->last_stop_at) : 0;
-	aging = wait / AGING_DIV;
+	aging_div = kp_aging_div ? kp_aging_div : 1;
+	max_rem_est_ns = kp_max_rem_est_ns ? kp_max_rem_est_ns : (200ULL * NSEC_PER_MSEC);
+	short_task_ns = kp_short_task_ns ? kp_short_task_ns : (80ULL * NSEC_PER_USEC);
+
+	aging = wait / aging_div;
 	rem_est_adj = rem_est + aging;
 
 	/* Clamp rem_est_adj to keep arithmetic bounded for verifier. */
-	if (rem_est_adj > MAX_REM_EST_NS)
-		rem_est_adj = MAX_REM_EST_NS;
+	if (rem_est_adj > max_rem_est_ns)
+		rem_est_adj = max_rem_est_ns;
 
 	deadline = vtime_now + scale_by_task_weight_inverse(p, rem_est_adj);
-	is_short = rem_est_adj <= SHORT_TASK_NS;
+	is_short = rem_est_adj <= short_task_ns;
 
 	/*
 	 * Short-burst tasks prefer per-CPU DSQs to reduce global queue

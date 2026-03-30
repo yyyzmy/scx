@@ -31,6 +31,20 @@ struct Opts {
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
+    /// Short-task threshold in microseconds.
+    /// Tasks with estimated remaining <= this threshold prefer per-CPU DSQs.
+    #[clap(long, default_value_t = 80)]
+    short_task_us: u64,
+
+    /// Aging divisor used in enqueue priority:
+    /// rem_est_adj = avg_runtime + wait / aging_div (minimum 1).
+    #[clap(long, default_value_t = 8)]
+    aging_div: u64,
+
+    /// Maximum estimated remaining runtime (milliseconds).
+    #[clap(long, default_value_t = 200)]
+    max_rem_est_ms: u64,
+
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -62,6 +76,10 @@ impl<'a> Scheduler<'a> {
         skel_builder.obj_builder.debug(opts.verbose);
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, kp_ops, open_opts)?;
+        let rodata = skel.maps.rodata_data.as_mut().unwrap();
+        rodata.kp_short_task_ns = opts.short_task_us * 1000;
+        rodata.kp_aging_div = opts.aging_div.max(1);
+        rodata.kp_max_rem_est_ns = opts.max_rem_est_ms * 1000 * 1000;
         let mut skel = scx_ops_load!(skel, kp_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, kp_ops)?);
 
