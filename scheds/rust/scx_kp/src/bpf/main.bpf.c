@@ -10,6 +10,8 @@
  *       rem_est_adj = clamp(avg_runtime + aging(wait), MAX_REM_EST)
  *       deadline_vtime = vtime_now + scale_by_task_weight_inverse(rem_est_adj)
  *     and insert into a global DSQ using deadline_vtime ordering.
+ *
+ * kp_enqueue_simple: 1 => minimal path (FIFO insert, local-first, no steal).
  */
 #include <scx/common.bpf.h>
 
@@ -70,6 +72,8 @@ UEI_DEFINE(uei);
 const volatile u64 kp_aging_div = 8ULL;
 const volatile u64 kp_max_rem_est_ns = 200ULL * NSEC_PER_MSEC;
 const volatile u64 kp_short_task_ns = 80ULL * NSEC_PER_USEC;
+/* 0: default (avg/aging/vtime + steal); 1: simple minimal */
+const volatile u64 kp_enqueue_simple = 0ULL;
 
 static __always_inline struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 {
@@ -147,23 +151,22 @@ s32 BPF_STRUCT_OPS(kp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
  */
 void BPF_STRUCT_OPS(kp_stopping, struct task_struct *p, bool runnable)
 {
-	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	struct task_ctx *tctx;
 	u64 now, slice;
 
+	if (kp_enqueue_simple) {
+		p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+		return;
+	}
+
+	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
 	now = bpf_ktime_get_ns();
 	slice = now - tctx->last_run_at;
-
-	/* Update avg burst length. */
 	tctx->avg_runtime = calc_avg(tctx->avg_runtime, slice);
 	tctx->last_stop_at = now;
-
-	/*
-	 * Keep scx_simple-style vtime accounting so vtime_now can advance and
-	 * dsq_vtime comparisons remain meaningful.
-	 */
 	p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
 }
 
@@ -172,13 +175,19 @@ void BPF_STRUCT_OPS(kp_stopping, struct task_struct *p, bool runnable)
  */
 void BPF_STRUCT_OPS(kp_running, struct task_struct *p)
 {
-	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	struct task_ctx *tctx;
 
+	if (kp_enqueue_simple) {
+		if (time_before(vtime_now, p->scx.dsq_vtime))
+			vtime_now = p->scx.dsq_vtime;
+		return;
+	}
+
+	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
 	tctx->last_run_at = bpf_ktime_get_ns();
-
 	if (time_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
 }
@@ -194,12 +203,29 @@ void BPF_STRUCT_OPS(kp_enable, struct task_struct *p)
  */
 void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	struct task_ctx *tctx;
 	u64 now, rem_est, wait, aging, rem_est_adj, deadline;
 	u64 aging_div, max_rem_est_ns, short_task_ns;
 	s32 prev_cpu;
 	bool is_short;
+	bool cpu_selected;
 
+	if (kp_enqueue_simple) {
+		cpu_selected = __COMPAT_is_enq_cpu_selected(enq_flags);
+		prev_cpu = scx_bpf_task_cpu(p);
+		if (prev_cpu < 0 || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+			prev_cpu = bpf_cpumask_first(p->cpus_ptr);
+		if (prev_cpu >= 0 && (u64)prev_cpu < nr_cpu_ids) {
+			scx_bpf_dsq_insert(p, cpu_dsq_id(prev_cpu), SCX_SLICE_DFL, enq_flags);
+			if (!cpu_selected)
+				scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+			return;
+		}
+		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+		return;
+	}
+
+	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
@@ -264,6 +290,9 @@ void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 
 	/* 2) Then shared queue. */
 	if (scx_bpf_dsq_move_to_local(SHARED_DSQ, 0))
+		return;
+
+	if (kp_enqueue_simple)
 		return;
 
 	/* 3) Lightweight steal from other per-CPU queues. */

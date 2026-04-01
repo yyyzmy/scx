@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use libbpf_rs::OpenObject;
 use log::{debug, info};
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
@@ -24,6 +24,15 @@ use scx_utils::UserExitInfo;
 use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 
 const SCHEDULER_NAME: &str = "scx_kp";
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum EnqueueMode {
+    /// FIFO dsq_insert, local-first, no avg/aging in enqueue, no steal in dispatch.
+    Simple,
+    /// Full: avg + aging + vtime insert, short->local, shared + per-CPU steal.
+    #[default]
+    Full,
+}
 
 #[derive(Clone, Debug, Parser)]
 struct Opts {
@@ -44,6 +53,10 @@ struct Opts {
     /// Maximum estimated remaining runtime (milliseconds).
     #[clap(long, default_value_t = 200)]
     max_rem_est_ms: u64,
+
+    /// full: avg/aging/vtime + steal; simple: minimal hot path.
+    #[clap(long, value_enum, default_value_t = EnqueueMode::Full)]
+    enqueue_mode: EnqueueMode,
 
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
@@ -80,6 +93,10 @@ impl<'a> Scheduler<'a> {
         rodata.kp_short_task_ns = opts.short_task_us * 1000;
         rodata.kp_aging_div = opts.aging_div.max(1);
         rodata.kp_max_rem_est_ns = opts.max_rem_est_ms * 1000 * 1000;
+        rodata.kp_enqueue_simple = match opts.enqueue_mode {
+            EnqueueMode::Simple => 1,
+            EnqueueMode::Full => 0,
+        };
         let mut skel = scx_ops_load!(skel, kp_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, kp_ops)?);
 
