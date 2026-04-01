@@ -258,9 +258,11 @@ fn write_target_comm_rodata(
     if s.is_empty() {
         anyhow::bail!("--target-comm must not be empty");
     }
-    let mut buf = [0u8; TARGET_COMM_BYTES];
+    let mut buf = [0i8; TARGET_COMM_BYTES];
     let take = s.len().min(TARGET_COMM_BYTES - 1);
-    buf[..take].copy_from_slice(&s.as_bytes()[..take]);
+    for (i, &b) in s.as_bytes()[..take].iter().enumerate() {
+        buf[i] = b as i8;
+    }
     rodata.target_comm = buf;
     Ok(())
 }
