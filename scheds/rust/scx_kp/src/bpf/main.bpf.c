@@ -12,6 +12,7 @@
  *     and insert into a global DSQ using deadline_vtime ordering.
  *
  * kp_enqueue_simple: 1 => minimal path (FIFO insert, local-first, no steal).
+ * kp_simple_softirq_isolate: in simple mode, ksoftirqd -> SHARED_DSQ only.
  */
 #include <scx/common.bpf.h>
 
@@ -74,6 +75,21 @@ const volatile u64 kp_max_rem_est_ns = 200ULL * NSEC_PER_MSEC;
 const volatile u64 kp_short_task_ns = 80ULL * NSEC_PER_USEC;
 /* 0: default (avg/aging/vtime + steal); 1: simple minimal */
 const volatile u64 kp_enqueue_simple = 0ULL;
+/* simple mode: 1 => ksoftirqd never uses per-CPU DSQ (shared only) */
+const volatile u64 kp_simple_softirq_isolate = 1ULL;
+
+static __always_inline bool task_is_ksoftirqd(const struct task_struct *p)
+{
+	const char *c;
+
+	if (!(p->flags & PF_KTHREAD))
+		return false;
+	c = p->comm;
+	/* "ksoftirqd/…" */
+	return c[0] == 'k' && c[1] == 's' && c[2] == 'o' && c[3] == 'f' &&
+	       c[4] == 't' && c[5] == 'i' && c[6] == 'r' && c[7] == 'q' &&
+	       c[8] == 'd';
+}
 
 static __always_inline struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 {
@@ -211,6 +227,10 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 	bool cpu_selected;
 
 	if (kp_enqueue_simple) {
+		if (kp_simple_softirq_isolate && task_is_ksoftirqd(p)) {
+			scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+			return;
+		}
 		cpu_selected = __COMPAT_is_enq_cpu_selected(enq_flags);
 		prev_cpu = scx_bpf_task_cpu(p);
 		if (prev_cpu < 0 || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))

@@ -58,6 +58,10 @@ struct Opts {
     #[clap(long, value_enum, default_value_t = EnqueueMode::Full)]
     enqueue_mode: EnqueueMode,
 
+    /// simple mode only: enqueue ksoftirqd to shared DSQ only (0=off, 1=on).
+    #[clap(long, default_value_t = 1)]
+    simple_softirq_isolate: u64,
+
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -96,6 +100,11 @@ impl<'a> Scheduler<'a> {
         rodata.kp_enqueue_simple = match opts.enqueue_mode {
             EnqueueMode::Simple => 1,
             EnqueueMode::Full => 0,
+        };
+        rodata.kp_simple_softirq_isolate = if opts.simple_softirq_isolate == 0 {
+            0
+        } else {
+            1
         };
         let mut skel = scx_ops_load!(skel, kp_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, kp_ops)?);
