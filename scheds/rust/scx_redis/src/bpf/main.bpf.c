@@ -8,6 +8,11 @@ const volatile bool fifo_sched;
 const volatile u32 main_slice_mult = 4;
 /* Softer vtime charge for main thread (higher = softer). */
 const volatile u32 main_vtime_div = 2;
+/*
+ * Prefix of task->comm for the workload main thread (learn redis_tgid).
+ * Default filled by userspace; must be NUL-terminated within TASK_COMM_LEN.
+ */
+const volatile char target_comm[TASK_COMM_LEN] = "redis-server";
 
 static u64 vtime_now;
 UEI_DEFINE(uei);
@@ -183,10 +188,24 @@ static void dec_group_load_for_cpu(s32 cpu)
 		__sync_fetch_and_sub(val, 1);
 }
 
+static bool comm_prefix_matches_target(const char *comm)
+{
+	int i;
+
+	for (i = 0; i < TASK_COMM_LEN; i++) {
+		char t = target_comm[i];
+
+		if (t == '\0')
+			return i != 0;
+		if (comm[i] != t)
+			return false;
+	}
+	return false;
+}
+
 static bool is_redis_task(const struct task_struct *p)
 {
 	char comm[TASK_COMM_LEN];
-	int i;
 	u32 tgid;
 	u8 one = 1;
 	u8 *tagp;
@@ -194,12 +213,8 @@ static bool is_redis_task(const struct task_struct *p)
 	if (bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm) <= 0)
 		goto check_tag;
 
-	const char pat[] = "redis-server";
-
-	for (i = 0; i < (int)sizeof(pat) - 1; i++) {
-		if (comm[i] != pat[i])
-			goto check_tag;
-	}
+	if (!comm_prefix_matches_target(comm))
+		goto check_tag;
 	/* Learn this redis process once we see its main comm. */
 	tgid = task_tgid(p);
 	bpf_map_update_elem(&redis_tgid, &tgid, &one, BPF_ANY);

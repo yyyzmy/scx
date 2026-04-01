@@ -30,6 +30,8 @@ use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMod
 
 const SCHEDULER_NAME: &str = "scx_redis";
 const SMT_MAX_SIBLINGS: usize = 2;
+/// Must match `TASK_COMM_LEN` in the kernel / BPF object (16).
+const TARGET_COMM_BYTES: usize = 16;
 
 fn parse_cpu_list(list: &str) -> Vec<u32> {
     let mut out = Vec::<u32>::new();
@@ -120,6 +122,11 @@ struct Opts {
     #[clap(long, default_value_t = 2)]
     main_vtime_div: u32,
 
+    /// Task `comm` prefix for the workload main thread (same semantics as before for `redis-server`).
+    /// Longer than 15 bytes is truncated. Used to tag the whole thread group via `redis_tgid`.
+    #[clap(long, default_value = "redis-server")]
+    target_comm: String,
+
     /// Enable verbose logging.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
@@ -128,7 +135,7 @@ struct Opts {
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
 
-    /// Monitor redis-server threads: CPU, group, main vs worker.
+    /// Monitor workload threads (same prefix as `--target-comm`): CPU, group, main vs worker.
     #[clap(long)]
     monitor_redis: Option<f64>,
 
@@ -201,6 +208,7 @@ impl<'a> Scheduler<'a> {
         rodata.fifo_sched = opts.fifo;
         rodata.main_slice_mult = opts.main_slice_mult;
         rodata.main_vtime_div = opts.main_vtime_div;
+        write_target_comm_rodata(rodata, &opts.target_comm)?;
 
         let mut skel = scx_ops_load!(skel, redis_ops, uei)?;
 
@@ -243,7 +251,21 @@ impl Drop for Scheduler<'_> {
     }
 }
 
-fn monitor_redis_groups() -> Result<()> {
+fn write_target_comm_rodata(
+    rodata: &mut bpf_skel::types::rodata,
+    s: &str,
+) -> Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("--target-comm must not be empty");
+    }
+    let mut buf = [0u8; TARGET_COMM_BYTES];
+    let take = s.len().min(TARGET_COMM_BYTES - 1);
+    buf[..take].copy_from_slice(&s.as_bytes()[..take]);
+    rodata.target_comm = buf;
+    Ok(())
+}
+
+fn monitor_redis_groups(prefix: &str) -> Result<()> {
     const GROUP_SIZE: usize = 8;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -253,7 +275,7 @@ fn monitor_redis_groups() -> Result<()> {
     for proc_res in all_processes()? {
         let Ok(proc) = proc_res else { continue };
         let Ok(stat) = proc.stat() else { continue };
-        if !stat.comm.starts_with("redis-server") {
+        if !stat.comm.starts_with(prefix) {
             continue;
         }
         let pid = stat.pid;
@@ -319,13 +341,14 @@ fn main() -> Result<()> {
 
     if let Some(intv) = opts.monitor_redis {
         let shutdown_copy = shutdown.clone();
+        let prefix = opts.target_comm.clone();
         std::thread::spawn(move || {
             let intv = Duration::from_secs_f64(intv);
             loop {
                 if shutdown_copy.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = monitor_redis_groups() {
+                if let Err(e) = monitor_redis_groups(&prefix) {
                     debug!("redis monitor error: {e:#}");
                 }
                 std::thread::sleep(intv);
