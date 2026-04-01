@@ -608,10 +608,10 @@ void BPF_STRUCT_OPS(redis_dispatch, s32 cpu, struct task_struct *prev)
 	 * Avoid starving non-redis kernel/user tasks in SHARED_DSQ
 	 * (e.g. ksoftirqd, iou-sqp) under heavy redis per-group traffic.
 	 */
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 
 	if (gid >= 0)
-		scx_bpf_dsq_move_to_local(group_dsq_id((u32)gid));
+		scx_bpf_dsq_move_to_local(group_dsq_id((u32)gid), 0);
 }
 
 void BPF_STRUCT_OPS(redis_running, struct task_struct *p)
