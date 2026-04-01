@@ -25,6 +25,39 @@ use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMod
 
 const SCHEDULER_NAME: &str = "scx_kp";
 
+fn parse_u64_token(tok: &str) -> anyhow::Result<u64> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return Ok(0);
+    }
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Ok(u64::from_str_radix(hex, 16)?)
+    } else {
+        Ok(t.parse()?)
+    }
+}
+
+/// Five u64 words: CPUs 0–63, 64–127, …, 256–319. Single token without comma sets word 0 only (compat).
+fn parse_kthread_cpu_mask(s: &str) -> anyhow::Result<[u64; 5]> {
+    let mut out = [0u64; 5];
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(out);
+    }
+    if !t.contains(',') {
+        out[0] = parse_u64_token(t)?;
+        return Ok(out);
+    }
+    let parts: Vec<&str> = t.split(',').collect();
+    if parts.len() > 5 {
+        anyhow::bail!("simple-kthread-mask: at most 5 comma-separated chunks (320 CPUs)");
+    }
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = parse_u64_token(p)?;
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum EnqueueMode {
     /// FIFO dsq_insert, local-first, no avg/aging in enqueue, no steal in dispatch.
@@ -61,6 +94,12 @@ struct Opts {
     /// simple mode only: enqueue ksoftirqd to shared DSQ only (0=off, 1=on).
     #[clap(long, default_value_t = 1)]
     simple_softirq_isolate: u64,
+
+    /// simple mode: kthread-dedicated CPUs as up to five u64 words (CPUs 0..320).
+    /// Format: "c0,c1,c2,c3,c4" (hex 0x.. or decimal); omit trailing zeros. One value without comma sets CPUs 0–63 only.
+    /// Example last 20 CPUs (300–319): "0,0,0,0,0xfffff00000000000"
+    #[clap(long)]
+    simple_kthread_mask: Option<String>,
 
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
@@ -106,6 +145,10 @@ impl<'a> Scheduler<'a> {
         } else {
             1
         };
+        let km = parse_kthread_cpu_mask(opts.simple_kthread_mask.as_deref().unwrap_or(""))?;
+        for i in 0..5 {
+            rodata.kp_simple_kthread_cpu_mask[i] = km[i];
+        }
         let mut skel = scx_ops_load!(skel, kp_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, kp_ops)?);
 

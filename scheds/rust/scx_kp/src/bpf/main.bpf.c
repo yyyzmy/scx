@@ -13,6 +13,9 @@
  *
  * kp_enqueue_simple: 1 => minimal path (FIFO insert, local-first, no steal).
  * kp_simple_softirq_isolate: in simple mode, ksoftirqd -> SHARED_DSQ only.
+ * kp_simple_kthread_cpu_mask[5]: simple mode, 320 CPUs as five u64 words
+ *   (CPUs 0-63 .. 256-319); bit set => kthread-dedicated (not ksoftirqd).
+ *   User tasks prefer idle CPUs outside this mask in select_cpu.
  */
 #include <scx/common.bpf.h>
 
@@ -35,6 +38,8 @@ char _license[] SEC("license") = "GPL";
 #define SHARED_DSQ 0
 #define CPU_DSQ_BASE 1
 #define MAX_CPUS 4096
+#define KTHREAD_MASK_CHUNKS 5
+#define KTHREAD_MASK_CPUS (KTHREAD_MASK_CHUNKS * 64)
 static u64 nr_cpu_ids;
 
 static __always_inline u64 cpu_dsq_id(s32 cpu)
@@ -77,6 +82,68 @@ const volatile u64 kp_short_task_ns = 80ULL * NSEC_PER_USEC;
 const volatile u64 kp_enqueue_simple = 0ULL;
 /* simple mode: 1 => ksoftirqd never uses per-CPU DSQ (shared only) */
 const volatile u64 kp_simple_softirq_isolate = 1ULL;
+/* simple mode: 5 words cover CPUs [0,320); all zero => feature off */
+const volatile u64 kp_simple_kthread_cpu_mask[KTHREAD_MASK_CHUNKS] = { 0, 0, 0, 0, 0 };
+
+static __always_inline bool kthread_mask_nonzero(void)
+{
+	u32 i;
+
+	bpf_for(i, 0, KTHREAD_MASK_CHUNKS) {
+		if (kp_simple_kthread_cpu_mask[i])
+			return true;
+	}
+	return false;
+}
+
+static __always_inline bool cpu_in_kthread_mask(s32 cpu)
+{
+	u32 chunk, bit;
+
+	if (cpu < 0)
+		return false;
+	if ((u32)cpu >= KTHREAD_MASK_CPUS)
+		return false;
+	chunk = (u32)cpu >> 6;
+	bit = (u32)cpu & 63;
+	return (kp_simple_kthread_cpu_mask[chunk] & (1ULL << bit)) != 0;
+}
+
+static __always_inline s32 pick_kthread_dedicated_cpu(struct task_struct *p)
+{
+	s32 c;
+
+	if (!kthread_mask_nonzero())
+		return -1;
+
+	bpf_for(c, 0, nr_cpu_ids) {
+		if (!cpu_in_kthread_mask(c))
+			continue;
+		if (bpf_cpumask_test_cpu(c, p->cpus_ptr))
+			return c;
+	}
+	return -1;
+}
+
+static __always_inline s32 pick_idle_cpu_outside_kthread_mask(struct task_struct *p, s32 prev_cpu)
+{
+	s32 c;
+
+	if (prev_cpu >= 0 && !cpu_in_kthread_mask(prev_cpu) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		return prev_cpu;
+
+	bpf_for(c, 0, nr_cpu_ids) {
+		if (cpu_in_kthread_mask(c))
+			continue;
+		if (!bpf_cpumask_test_cpu(c, p->cpus_ptr))
+			continue;
+		if (scx_bpf_test_and_clear_cpu_idle(c))
+			return c;
+	}
+	return -1;
+}
 
 static __always_inline bool task_is_ksoftirqd(const struct task_struct *p)
 {
@@ -154,6 +221,21 @@ s32 BPF_STRUCT_OPS(kp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
 	if (prev_cpu < 0 || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		prev_cpu = bpf_cpumask_first(p->cpus_ptr);
 
+	if (kp_enqueue_simple && kthread_mask_nonzero()) {
+		if ((p->flags & PF_KTHREAD) && !task_is_ksoftirqd(p)) {
+			cpu = pick_kthread_dedicated_cpu(p);
+			if (cpu >= 0) {
+				if (scx_bpf_test_and_clear_cpu_idle(cpu))
+					return cpu;
+				return cpu;
+			}
+		} else if (!(p->flags & PF_KTHREAD)) {
+			cpu = pick_idle_cpu_outside_kthread_mask(p, prev_cpu);
+			if (cpu >= 0)
+				return cpu;
+		}
+	}
+
 	if (prev_cpu >= 0 && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 		return prev_cpu;
 
@@ -230,6 +312,16 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 		if (kp_simple_softirq_isolate && task_is_ksoftirqd(p)) {
 			scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 			return;
+		}
+		if (kthread_mask_nonzero() && (p->flags & PF_KTHREAD) &&
+		    !task_is_ksoftirqd(p)) {
+			prev_cpu = pick_kthread_dedicated_cpu(p);
+			if (prev_cpu >= 0 && (u64)prev_cpu < nr_cpu_ids) {
+				scx_bpf_dsq_insert(p, cpu_dsq_id(prev_cpu), SCX_SLICE_DFL, enq_flags);
+				if (!__COMPAT_is_enq_cpu_selected(enq_flags))
+					scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+				return;
+			}
 		}
 		cpu_selected = __COMPAT_is_enq_cpu_selected(enq_flags);
 		prev_cpu = scx_bpf_task_cpu(p);
