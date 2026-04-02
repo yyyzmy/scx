@@ -91,6 +91,18 @@ struct Opts {
     #[clap(long, default_value_t = 16)]
     steal_max_cpus: u64,
 
+    /// full: learned priority switch (wait high + wake freq high => LEARN_DSQ).
+    #[clap(long, default_value_t = 0)]
+    full_learn_prio: u64,
+
+    /// full: minimum waiting time (us) to be considered learned-high priority.
+    #[clap(long, default_value_t = 500)]
+    full_wait_thr_us: u64,
+
+    /// full: maximum enqueue interval (us) between two consecutive enqueues to be high wake frequency.
+    #[clap(long, default_value_t = 100)]
+    full_wake_interval_thr_us: u64,
+
     /// full: avg/aging/vtime + steal; simple: minimal hot path.
     #[clap(long, value_enum, default_value_t = EnqueueMode::Full)]
     enqueue_mode: EnqueueMode,
@@ -153,6 +165,9 @@ impl<'a> Scheduler<'a> {
         rodata.kp_aging_div = opts.aging_div.max(1);
         rodata.kp_max_rem_est_ns = opts.max_rem_est_ms * 1000 * 1000;
         rodata.kp_steal_max_cpus = opts.steal_max_cpus.clamp(1, 16);
+        rodata.kp_full_learn_prio = if opts.full_learn_prio == 0 { 0 } else { 1 };
+        rodata.kp_full_wait_thr_ns = opts.full_wait_thr_us * 1000;
+        rodata.kp_full_wake_interval_thr_ns = opts.full_wake_interval_thr_us * 1000;
         rodata.kp_enqueue_simple = match opts.enqueue_mode {
             EnqueueMode::Simple => 1,
             EnqueueMode::Full => 0,

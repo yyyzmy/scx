@@ -92,6 +92,10 @@ const volatile u64 kp_simple_learn_prio = 0ULL;
 /* thresholds in ns */
 const volatile u64 kp_simple_wait_thr_ns = 0ULL;
 const volatile u64 kp_simple_wake_interval_thr_ns = 0ULL;
+/* full learned priority: same rule, applied before avg/aging sorting */
+const volatile u64 kp_full_learn_prio = 0ULL;
+const volatile u64 kp_full_wait_thr_ns = 0ULL;
+const volatile u64 kp_full_wake_interval_thr_ns = 0ULL;
 /* simple mode: 5 words cover CPUs [0,320); all zero => feature off */
 const volatile u64 kp_simple_kthread_cpu_mask[KTHREAD_MASK_CHUNKS] = { 0, 0, 0, 0, 0 };
 
@@ -395,6 +399,23 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 
 	now = bpf_ktime_get_ns();
 
+	if (kp_full_learn_prio) {
+		wait = tctx->last_stop_at ? (now - tctx->last_stop_at) : 0;
+		if (tctx->last_enq_at) {
+			rem_est_adj = now - tctx->last_enq_at;
+		} else {
+			rem_est_adj = 0;
+		}
+		tctx->last_enq_at = now;
+
+		if (wait >= kp_full_wait_thr_ns &&
+		    rem_est_adj > 0 &&
+		    rem_est_adj <= kp_full_wake_interval_thr_ns) {
+			scx_bpf_dsq_insert_vtime(p, LEARN_DSQ, SCX_SLICE_DFL, vtime_now, enq_flags);
+			return;
+		}
+	}
+
 	rem_est = tctx->avg_runtime;
 	if (!rem_est)
 		rem_est = SCX_SLICE_DFL;
@@ -449,7 +470,7 @@ void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 	u64 off, lim;
 	s32 victim;
 
-	/* Learned high-priority tasks first (simple mode only). */
+	/* Learned high-priority tasks first (simple/full if enabled). */
 	if (scx_bpf_dsq_move_to_local(LEARN_DSQ, 0))
 		return;
 
