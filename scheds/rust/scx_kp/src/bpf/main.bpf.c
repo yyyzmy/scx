@@ -36,6 +36,8 @@ char _license[] SEC("license") = "GPL";
  *  - shared DSQ: fallback and long-task queue
  */
 #define SHARED_DSQ 0
+/* simple: learned high-priority queue (FIFO) */
+#define LEARN_DSQ 4097
 #define CPU_DSQ_BASE 1
 #define MAX_CPUS 4096
 #define KTHREAD_MASK_CHUNKS 5
@@ -56,6 +58,7 @@ static __always_inline u64 calc_avg(u64 old_val, u64 new_val)
 struct task_ctx {
 	u64 last_run_at;
 	u64 last_stop_at;
+	u64 last_enq_at;
 	u64 avg_runtime;
 };
 
@@ -84,6 +87,11 @@ const volatile u64 kp_steal_max_cpus = 16ULL;
 const volatile u64 kp_enqueue_simple = 0ULL;
 /* simple mode: 1 => ksoftirqd never uses per-CPU DSQ (shared only) */
 const volatile u64 kp_simple_softirq_isolate = 1ULL;
+/* simple learned priority: 1 => wait high && wake freq high => enqueue to LEARN_DSQ */
+const volatile u64 kp_simple_learn_prio = 0ULL;
+/* thresholds in ns */
+const volatile u64 kp_simple_wait_thr_ns = 0ULL;
+const volatile u64 kp_simple_wake_interval_thr_ns = 0ULL;
 /* simple mode: 5 words cover CPUs [0,320); all zero => feature off */
 const volatile u64 kp_simple_kthread_cpu_mask[KTHREAD_MASK_CHUNKS] = { 0, 0, 0, 0, 0 };
 
@@ -195,6 +203,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(kp_init)
 	if (err)
 		return err;
 
+	err = scx_bpf_create_dsq(LEARN_DSQ, -1);
+	if (err)
+		return err;
+
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 	if (nr_cpu_ids > MAX_CPUS)
 		nr_cpu_ids = MAX_CPUS;
@@ -255,6 +267,11 @@ void BPF_STRUCT_OPS(kp_stopping, struct task_struct *p, bool runnable)
 	u64 now, slice;
 
 	if (kp_enqueue_simple) {
+		tctx = try_lookup_task_ctx(p);
+		if (tctx) {
+			now = bpf_ktime_get_ns();
+			tctx->last_stop_at = now;
+		}
 		p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
 		return;
 	}
@@ -311,6 +328,39 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
 	bool cpu_selected;
 
 	if (kp_enqueue_simple) {
+		cpu_selected = __COMPAT_is_enq_cpu_selected(enq_flags);
+
+		if (kp_simple_learn_prio) {
+			tctx = try_lookup_task_ctx(p);
+			if (tctx) {
+				if (!(kp_simple_softirq_isolate && task_is_ksoftirqd(p))) {
+					now = bpf_ktime_get_ns();
+					wait = tctx->last_stop_at ? (now - tctx->last_stop_at) : 0;
+					/* wake freq: two consecutive enqueues close together */
+					if (tctx->last_enq_at) {
+						rem_est_adj = now - tctx->last_enq_at;
+					} else {
+						rem_est_adj = 0;
+					}
+					tctx->last_enq_at = now;
+
+					if (wait >= kp_simple_wait_thr_ns &&
+					    rem_est_adj > 0 &&
+					    rem_est_adj <= kp_simple_wake_interval_thr_ns) {
+						/* learned high priority */
+						scx_bpf_dsq_insert(p, LEARN_DSQ, SCX_SLICE_DFL, enq_flags);
+						if (!cpu_selected) {
+							prev_cpu = scx_bpf_task_cpu(p);
+							if (prev_cpu >= 0 && (u64)prev_cpu < nr_cpu_ids &&
+							    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+								scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+						}
+						return;
+					}
+				}
+			}
+		}
+
 		if (kp_simple_softirq_isolate && task_is_ksoftirqd(p)) {
 			scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 			return;
@@ -398,6 +448,10 @@ void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 {
 	u64 off, lim;
 	s32 victim;
+
+	/* Learned high-priority tasks first (simple mode only). */
+	if (scx_bpf_dsq_move_to_local(LEARN_DSQ, 0))
+		return;
 
 	/* 1) Own per-CPU queue first. */
 	if ((u64)cpu < nr_cpu_ids && scx_bpf_dsq_move_to_local(cpu_dsq_id(cpu), 0))

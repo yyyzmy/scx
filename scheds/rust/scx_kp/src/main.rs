@@ -105,6 +105,18 @@ struct Opts {
     #[clap(long)]
     simple_kthread_mask: Option<String>,
 
+    /// simple: learned priority switch (wait high + wake freq high => enqueue to LEARN_DSQ).
+    #[clap(long, default_value_t = 0)]
+    simple_learn_prio: u64,
+
+    /// simple: minimum waiting time (us) to be considered learned-high priority.
+    #[clap(long, default_value_t = 500)]
+    simple_wait_thr_us: u64,
+
+    /// simple: maximum enqueue interval (us) between two consecutive enqueues to be considered high wake frequency.
+    #[clap(long, default_value_t = 100)]
+    simple_wake_interval_thr_us: u64,
+
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -150,6 +162,9 @@ impl<'a> Scheduler<'a> {
         } else {
             1
         };
+        rodata.kp_simple_learn_prio = if opts.simple_learn_prio == 0 { 0 } else { 1 };
+        rodata.kp_simple_wait_thr_ns = opts.simple_wait_thr_us * 1000;
+        rodata.kp_simple_wake_interval_thr_ns = opts.simple_wake_interval_thr_us * 1000;
         let km = parse_kthread_cpu_mask(opts.simple_kthread_mask.as_deref().unwrap_or(""))?;
         for i in 0..5 {
             rodata.kp_simple_kthread_cpu_mask[i] = km[i];
