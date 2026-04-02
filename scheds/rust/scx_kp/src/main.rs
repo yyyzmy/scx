@@ -87,6 +87,10 @@ struct Opts {
     #[clap(long, default_value_t = 200)]
     max_rem_est_ms: u64,
 
+    /// full mode only: max per-CPU steal attempts per dispatch (1-16, ring from cpu+1).
+    #[clap(long, default_value_t = 16)]
+    steal_max_cpus: u64,
+
     /// full: avg/aging/vtime + steal; simple: minimal hot path.
     #[clap(long, value_enum, default_value_t = EnqueueMode::Full)]
     enqueue_mode: EnqueueMode,
@@ -136,6 +140,7 @@ impl<'a> Scheduler<'a> {
         rodata.kp_short_task_ns = opts.short_task_us * 1000;
         rodata.kp_aging_div = opts.aging_div.max(1);
         rodata.kp_max_rem_est_ns = opts.max_rem_est_ms * 1000 * 1000;
+        rodata.kp_steal_max_cpus = opts.steal_max_cpus.clamp(1, 16);
         rodata.kp_enqueue_simple = match opts.enqueue_mode {
             EnqueueMode::Simple => 1,
             EnqueueMode::Full => 0,

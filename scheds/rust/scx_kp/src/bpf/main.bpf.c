@@ -78,6 +78,8 @@ UEI_DEFINE(uei);
 const volatile u64 kp_aging_div = 8ULL;
 const volatile u64 kp_max_rem_est_ns = 200ULL * NSEC_PER_MSEC;
 const volatile u64 kp_short_task_ns = 80ULL * NSEC_PER_USEC;
+/* full mode: max directed steal attempts per dispatch (1..16, default 16) */
+const volatile u64 kp_steal_max_cpus = 16ULL;
 /* 0: default (avg/aging/vtime + steal); 1: simple minimal */
 const volatile u64 kp_enqueue_simple = 0ULL;
 /* simple mode: 1 => ksoftirqd never uses per-CPU DSQ (shared only) */
@@ -394,7 +396,8 @@ void BPF_STRUCT_OPS(kp_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 {
-	u64 src;
+	u64 off, lim;
+	s32 victim;
 
 	/* 1) Own per-CPU queue first. */
 	if ((u64)cpu < nr_cpu_ids && scx_bpf_dsq_move_to_local(cpu_dsq_id(cpu), 0))
@@ -407,11 +410,25 @@ void BPF_STRUCT_OPS(kp_dispatch, s32 cpu, struct task_struct *prev)
 	if (kp_enqueue_simple)
 		return;
 
-	/* 3) Lightweight steal from other per-CPU queues. */
-	bpf_for(src, 0, nr_cpu_ids) {
-		if ((s32)src == cpu)
+	/*
+	 * 3) Directed steal: at most 16 attempts, ring from cpu+1 (not full scan).
+	 *    bpf_for upper bound is constant for the verifier.
+	 */
+	lim = kp_steal_max_cpus ? kp_steal_max_cpus : 16;
+	if (lim > 16)
+		lim = 16;
+	if (lim < 1)
+		lim = 1;
+
+	bpf_for(off, 0, 16) {
+		if (off >= lim)
 			continue;
-		if (scx_bpf_dsq_move_to_local(cpu_dsq_id((s32)src), 0))
+		if (nr_cpu_ids <= 1)
+			break;
+		victim = (s32)(((u64)cpu + 1 + off) % nr_cpu_ids);
+		if (victim == cpu)
+			continue;
+		if (scx_bpf_dsq_move_to_local(cpu_dsq_id(victim), 0))
 			return;
 	}
 }
