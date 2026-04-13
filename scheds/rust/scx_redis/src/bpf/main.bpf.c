@@ -12,7 +12,7 @@ const volatile u32 main_vtime_div = 2;
  * Prefix of task->comm for the workload main thread (learn redis_tgid).
  * Default filled by userspace; must be NUL-terminated within TASK_COMM_LEN.
  */
-const volatile char target_comm[TASK_COMM_LEN] = "redis-server";
+const volatile char target_comm[TASK_COMM_LEN] = "Wisp-";
 
 static u64 vtime_now;
 UEI_DEFINE(uei);

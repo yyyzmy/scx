@@ -122,9 +122,9 @@ struct Opts {
     #[clap(long, default_value_t = 2)]
     main_vtime_div: u32,
 
-    /// Task `comm` prefix for the workload main thread (same semantics as before for `redis-server`).
+    /// Task `comm` prefix for the workload main thread (default `Wisp-`).
     /// Longer than 15 bytes is truncated. Used to tag the whole thread group via `redis_tgid`.
-    #[clap(long, default_value = "redis-server")]
+    #[clap(long, default_value = "Wisp-")]
     target_comm: String,
 
     /// Enable verbose logging.
