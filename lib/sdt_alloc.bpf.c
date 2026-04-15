@@ -289,15 +289,35 @@ scx_alloc_init(struct scx_allocator *alloc, __u64 data_size)
 	if (ret != 0)
 		return ret;
 
-	prealloc_stack = bpf_arena_alloc_pages(&arena, NULL, div_round_up(sizeof(*prealloc_stack), PAGE_SIZE), NUMA_NO_NODE, 0);
-	if (prealloc_stack == NULL)
-		return -ENOMEM;
+	/*
+	 * Keep the arena pointer in a local until scx_alloc_stack() finishes.
+	 * Some verifiers treat bpf_arena_alloc_pages()'s return as a scalar once
+	 * it is spilled to the prealloc_stack global, which then breaks
+	 * scx_alloc_attempt(prealloc_stack) (R6 invalid mem access 'scalar').
+	 */
+	{
+		struct scx_alloc_stack __arena *stack;
+		int i;
+
+		stack = bpf_arena_alloc_pages(&arena, NULL,
+					      div_round_up(sizeof(*prealloc_stack), PAGE_SIZE),
+					      NUMA_NO_NODE, 0);
+		if (stack == NULL)
+			return -ENOMEM;
+		prealloc_stack = stack;
+
+		ret = -ENOMEM;
+		for (i = zero; i < SDT_TASK_ALLOC_ATTEMPTS && can_loop; i++) {
+			if (scx_alloc_stack(stack) == 0) {
+				ret = 0;
+				break;
+			}
+		}
+		if (ret != 0)
+			return ret;
+	}
 
 	/* On success, returns with the lock taken. */
-	ret = scx_alloc_attempt(prealloc_stack);
-	if (ret != 0)
-		return ret;
-
 	alloc->root = scx_alloc_chunk(prealloc_stack);
 
 	bpf_spin_unlock(&alloc_lock);
