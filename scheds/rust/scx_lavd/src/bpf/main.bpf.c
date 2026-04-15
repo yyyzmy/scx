@@ -1199,7 +1199,6 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
 	__sync_fetch_and_add(&nr_cpus_onln, 1);
 	__sync_fetch_and_add(&total_capacity, cpuc->capacity);
 	update_autopilot_high_cap();
-	update_sys_stat();
 }
 
 void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
@@ -1222,7 +1221,6 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	__sync_fetch_and_sub(&nr_cpus_onln, 1);
 	__sync_fetch_and_sub(&total_capacity, cpuc->capacity);
 	update_autopilot_high_cap();
-	update_sys_stat();
 }
 
 void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
