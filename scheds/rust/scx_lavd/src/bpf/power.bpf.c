@@ -626,7 +626,6 @@ static int reinit_active_cpumask_for_performance(void)
 		}
 	} else {
 		online_cpumask = scx_bpf_get_online_cpumask();
-		nr_cpus_onln = cpumask_count(online_cpumask);
 		bpf_cpumask_copy(active, online_cpumask);
 		scx_bpf_put_cpumask(online_cpumask);
 

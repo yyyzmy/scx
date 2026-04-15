@@ -1503,7 +1503,6 @@ static int init_cpumasks(void)
 		goto out;
 
 	online_cpumask = scx_bpf_get_online_cpumask();
-	nr_cpus_onln = cpumask_count(online_cpumask);
 	bpf_cpumask_copy(active, online_cpumask);
 	scx_bpf_put_cpumask(online_cpumask);
 
@@ -1538,7 +1537,7 @@ static s32 init_per_cpu_ctx(u64 now)
 	struct cpdom_ctx *cpdomc;
 	int cpu, i, j, err = 0;
 	u64 cpdom_id;
-	u32 sum_capacity = 0, big_capacity = 0;
+	u32 sum_capacity = 0, big_capacity = 0, nr_online = 0;
 
 	bpf_rcu_read_lock();
 	online_cpumask = scx_bpf_get_online_cpumask();
@@ -1609,6 +1608,8 @@ static s32 init_per_cpu_ctx(u64 now)
 		cpuc->offline_clk = now;
 		cpuc->cpu_release_clk = now;
 		cpuc->is_online = bpf_cpumask_test_cpu(cpu, online_cpumask);
+		if (cpuc->is_online)
+			nr_online++;
 		cpuc->capacity = cpu_capacity[cpu];
 		cpuc->big_core = cpu_big[cpu];
 		cpuc->turbo_core = cpu_turbo[cpu];
@@ -1638,6 +1639,7 @@ static s32 init_per_cpu_ctx(u64 now)
 	}
 	default_big_core_scale = (big_capacity << LAVD_SHIFT) / sum_capacity;
 	total_capacity = sum_capacity;
+	nr_cpus_onln = nr_online;
 
 	/*
 	 * Initialize compute domain id.
