@@ -240,6 +240,21 @@ static bool use_full_cpus(void)
 	return sys_stat.nr_active >= nr_cpus_onln;
 }
 
+static __always_inline u32 cpumask_count(const struct cpumask *cpumask)
+{
+	u32 cnt = 0;
+	int cpu;
+
+	bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+		if (cpu >= nr_cpu_ids)
+			break;
+		if (bpf_cpumask_test_cpu(cpu, cpumask))
+			cnt++;
+	}
+
+	return cnt;
+}
+
 s64 __attribute__ ((noinline)) pick_any_bit(u64 bitmap, u64 nuance)
 {
 	u64 i, pos;

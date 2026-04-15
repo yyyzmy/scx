@@ -1293,7 +1293,7 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		return;
 	}
 
-	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
+	if (p->nr_cpus_allowed != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
@@ -1389,7 +1389,7 @@ static void init_task_ctx(struct task_struct *p, struct task_ctx *taskc)
 	u64 now = scx_bpf_now();
 
 	__builtin_memset(taskc, 0, sizeof(*taskc));
-	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
+	if (p->nr_cpus_allowed != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
@@ -1503,7 +1503,7 @@ static int init_cpumasks(void)
 		goto out;
 
 	online_cpumask = scx_bpf_get_online_cpumask();
-	nr_cpus_onln = bpf_cpumask_weight(online_cpumask);
+	nr_cpus_onln = cpumask_count(online_cpumask);
 	bpf_cpumask_copy(active, online_cpumask);
 	scx_bpf_put_cpumask(online_cpumask);
 
