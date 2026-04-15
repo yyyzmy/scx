@@ -130,16 +130,13 @@ static bool is_perf_cri(struct task_ctx *taskc)
 static const volatile u16 *get_cpu_order(void)
 {
 	s32 pco = READ_ONCE(pco_idx);
-	u32 i;
 
-	if (pco < 0 || pco >= LAVD_PCO_STATE_MAX) {
-		scx_bpf_error("Incorrect PCO state: %d", pco);
-		i = 0;
-	} else {
-		i = (u32)pco;
-	}
+	if (pco < 0)
+		return pco_table[0];
+	if (pco >= LAVD_PCO_STATE_MAX)
+		return pco_table[0];
 
-	return pco_table[i];
+	return pco_table[(u32)pco];
 }
 
 static u64 calc_required_capacity(void)
