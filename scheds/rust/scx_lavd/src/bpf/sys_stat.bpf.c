@@ -429,14 +429,7 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 {
 	int err;
 
-	/*
-	 * Keep timer callback lightweight for verifier compatibility.
-	 * Heavy update paths can be restored incrementally.
-	 */
-	sys_stat.last_update_clk = scx_bpf_now();
-	sys_stat.nr_active = nr_cpus_onln;
-	calc_sys_time_slice();
-	update_thr_perf_cri();
+	/* Keep async callback minimal for verifier compatibility. */
 
 	err = bpf_timer_start(timer, LAVD_SYS_STAT_INTERVAL_NS, 0);
 	if (err)
