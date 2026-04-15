@@ -599,7 +599,9 @@ static int reinit_active_cpumask_for_performance(void)
 	 * In a symmetric system, all online CPUs belong to the active set.
 	 */
 	if (have_little_core) {
-		bpf_for(cpu, 0, nr_cpu_ids) {
+		bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+			if (cpu >= nr_cpu_ids)
+				break;
 			cpuc = get_cpu_ctx_id(cpu);
 			if (!cpuc)
 				continue;
@@ -631,7 +633,9 @@ static int reinit_active_cpumask_for_performance(void)
 
 		bpf_cpumask_clear(ovrflw);
 
-		bpf_for(cpu, 0, nr_cpu_ids) {
+		bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+			if (cpu >= nr_cpu_ids)
+				break;
 			cpuc = get_cpu_ctx_id(cpu);
 			if (!cpuc || !cpuc->is_online)
 				continue;
