@@ -429,7 +429,14 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 {
 	int err;
 
-	update_sys_stat();
+	/*
+	 * Keep timer callback lightweight for verifier compatibility.
+	 * Heavy update paths can be restored incrementally.
+	 */
+	sys_stat.last_update_clk = scx_bpf_now();
+	sys_stat.nr_active = nr_cpus_onln;
+	calc_sys_time_slice();
+	update_thr_perf_cri();
 
 	err = bpf_timer_start(timer, LAVD_SYS_STAT_INTERVAL_NS, 0);
 	if (err)
@@ -441,7 +448,10 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 static s32 init_sys_stat(u64 now)
 {
 	struct cpdom_ctx *cpdomc;
+	struct bpf_timer *timer;
 	u64 cpdom_id;
+	u32 key = 0;
+	int err;
 
 	sys_stat.last_update_clk = now;
 	sys_stat.nr_active = nr_cpus_onln;
@@ -454,10 +464,19 @@ static s32 init_sys_stat(u64 now)
 		if (cpdomc->nr_active_cpus)
 			sys_stat.nr_active_cpdoms++;
 	}
-	/*
-	 * Some kernels reject the async timer callback path due to verifier
-	 * complexity; keep init minimal for compatibility.
-	 */
+	timer = bpf_map_lookup_elem(&update_timer, &key);
+	if (!timer) {
+		scx_bpf_error("Failed to lookup update timer");
+		return -ESRCH;
+	}
+	bpf_timer_init(timer, &update_timer, CLOCK_BOOTTIME);
+	bpf_timer_set_callback(timer, update_timer_cb);
+	err = bpf_timer_start(timer, LAVD_SYS_STAT_INTERVAL_NS, 0);
+	if (err) {
+		scx_bpf_error("Failed to arm update timer");
+		return err;
+	}
+
 	return 0;
 }
 
