@@ -161,12 +161,9 @@ bool init_idle_ato_masks(struct pick_ctx *ctx, const struct cpumask *idle_mask)
 
 static s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 {
-	const volatile u16 *cpu_order = get_cpu_order();
 	const struct cpumask *online_mask;
 	struct bpf_cpumask *online_src_mask;
 	s32 cpu;
-	u32 idx;
-	int i;
 
 	/*
 	 * online_src_mask = src_mask ∩ online_mask
@@ -179,22 +176,10 @@ static s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 	bpf_cpumask_and(online_src_mask, src_mask, online_mask);
 	scx_bpf_put_cpumask(online_mask);
 
-	/*
-	 * Find a proper CPU in the preferred CPU order.
-	 */
-	bpf_for(i, 0, LAVD_CPU_ID_MAX) {
-		if (i < 0)
-			continue;
-		idx = i;
-		if (idx < sys_stat.nr_active)
-			continue;
-		if (idx >= nr_cpu_ids)
-			break;
+	cpu = bpf_cpumask_any_distribute(cast_mask(online_src_mask));
+	if (cpu < nr_cpu_ids)
+		return cpu;
 
-		cpu = cpu_order[idx];
-		if (bpf_cpumask_test_cpu(cpu, cast_mask(online_src_mask)))
-			return cpu;
-	};
 	return -ENOENT;
 }
 
