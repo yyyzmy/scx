@@ -41,8 +41,8 @@ struct pick_ctx {
 	/*
 	 * Additional input arguments for test_cpu_stickable().
 	 */
-	unsigned int i_m;
-	unsigned int i_nm;
+	u8 i_m;
+	u8 i_nm;
 	s32 cpus_match[2];
 	s32 cpus_not_match[2];
 	s64 cpdoms_match[2];
@@ -365,7 +365,7 @@ bool can_run_on_domain(struct pick_ctx *ctx, s64 cpdom)
 static __always_inline
 bool test_cpu_stickable(struct pick_ctx *ctx, s32 cpu, bool is_task_big)
 {
-	u32 i_m, i_nm;
+	u8 i_m, i_nm;
 
 	if (can_run_on_cpu(ctx, cpu)) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
