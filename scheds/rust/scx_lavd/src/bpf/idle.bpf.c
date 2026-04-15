@@ -165,6 +165,7 @@ static s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 	const struct cpumask *online_mask;
 	struct bpf_cpumask *online_src_mask;
 	s32 cpu;
+	u32 idx;
 	int i;
 
 	/*
@@ -182,12 +183,15 @@ static s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 	 * Find a proper CPU in the preferred CPU order.
 	 */
 	bpf_for(i, 0, LAVD_CPU_ID_MAX) {
-		if (i < sys_stat.nr_active)
+		if (i < 0)
 			continue;
-		if (i >= nr_cpu_ids)
+		idx = i;
+		if (idx < sys_stat.nr_active)
+			continue;
+		if (idx >= nr_cpu_ids)
 			break;
 
-		cpu = cpu_order[i];
+		cpu = cpu_order[idx];
 		if (bpf_cpumask_test_cpu(cpu, cast_mask(online_src_mask)))
 			return cpu;
 	};
