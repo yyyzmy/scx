@@ -429,7 +429,9 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 {
 	int err;
 
-	/* Keep async callback minimal for verifier compatibility. */
+	sys_stat.nr_active = nr_cpus_onln;
+	calc_sys_time_slice();
+	update_thr_perf_cri();
 
 	err = bpf_timer_start(timer, LAVD_SYS_STAT_INTERVAL_NS, 0);
 	if (err)
