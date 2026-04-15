@@ -181,8 +181,10 @@ static s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 	/*
 	 * Find a proper CPU in the preferred CPU order.
 	 */
-	bpf_for(i, sys_stat.nr_active, nr_cpu_ids) {
-		if (i >= LAVD_CPU_ID_MAX)
+	bpf_for(i, 0, LAVD_CPU_ID_MAX) {
+		if (i < sys_stat.nr_active)
+			continue;
+		if (i >= nr_cpu_ids)
 			break;
 
 		cpu = cpu_order[i];
