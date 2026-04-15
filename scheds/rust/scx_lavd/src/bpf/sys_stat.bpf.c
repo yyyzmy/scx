@@ -99,7 +99,9 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 	/*
 	 * Collect statistics for each CPU.
 	 */
-	bpf_for(cpu, 0, nr_cpu_ids) {
+	bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+		if (cpu >= nr_cpu_ids)
+			break;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			c->compute_total = 0;

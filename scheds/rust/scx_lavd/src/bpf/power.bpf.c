@@ -197,8 +197,8 @@ static int calc_nr_active_cpus(void)
 		else
 			WRITE_ONCE(pco_idx, nr_pco_states - 1);
 
-		bpf_for(i, 0, nr_cpu_ids) {
-			if (i >= LAVD_CPU_ID_MAX)
+		bpf_for(i, 0, LAVD_CPU_ID_MAX) {
+			if (i >= nr_cpu_ids)
 				break;
 
 			cpu_id = cpu_order[i];
@@ -267,8 +267,8 @@ static void do_core_compaction(void)
 	/*
 	 * Assign active and overflow cores.
 	 */
-	bpf_for(i, 0, nr_cpu_ids) {
-		if (i >= LAVD_CPU_ID_MAX)
+	bpf_for(i, 0, LAVD_CPU_ID_MAX) {
+		if (i >= nr_cpu_ids)
 			break;
 
 		/*

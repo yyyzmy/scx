@@ -1558,8 +1558,8 @@ static s32 init_per_cpu_ctx(u64 now)
 	 * Initilize CPU info
 	 */
 	one_little_capacity = LAVD_SCALE;
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (cpu >= LAVD_CPU_ID_MAX)
+	bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+		if (cpu >= nr_cpu_ids)
 			break;
 
 		cpuc = get_cpu_ctx_id(cpu);
@@ -1684,7 +1684,9 @@ static s32 init_per_cpu_ctx(u64 now)
 	/*
 	 * Print some useful informatin for debugging.
 	 */
-	bpf_for(cpu, 0, nr_cpu_ids) {
+	bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+		if (cpu >= nr_cpu_ids)
+			break;
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
@@ -1710,7 +1712,9 @@ static int init_per_cpu_dsqs(void)
 	struct cpu_ctx *cpuc;
 	int cpu, err = 0;
 
-	bpf_for(cpu, 0, nr_cpu_ids) {
+	bpf_for(cpu, 0, LAVD_CPU_ID_MAX) {
+		if (cpu >= nr_cpu_ids)
+			break;
 		/*
 		 * Create Per-CPU DSQs on its associated NUMA domain.
 		 */

@@ -119,7 +119,9 @@ static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 	 * be too expensive to perform every task queue. We need to revisit
 	 * this if the traversal cost becomes problematic.
 	 */
-	bpf_for(i, 0, nr_cpu_ids) {
+	bpf_for(i, 0, LAVD_CPU_ID_MAX) {
+		if (i >= nr_cpu_ids)
+			break;
 
 		/*
 		 * Decide a CPU ID to examine.
