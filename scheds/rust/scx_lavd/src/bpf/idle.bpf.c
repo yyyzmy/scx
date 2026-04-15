@@ -365,20 +365,27 @@ bool can_run_on_domain(struct pick_ctx *ctx, s64 cpdom)
 static __always_inline
 bool test_cpu_stickable(struct pick_ctx *ctx, s32 cpu, bool is_task_big)
 {
+	u32 i_m, i_nm;
+
 	if (can_run_on_cpu(ctx, cpu)) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
-		if (!cpuc || ctx->i_m >= 2 || ctx->i_nm >= 2)
+		if (!cpuc)
+			return false;
+
+		i_m = ctx->i_m;
+		i_nm = ctx->i_nm;
+		if (i_m >= 2 || i_nm >= 2)
 			return false;
 
 		if (is_task_big == cpuc->big_core) {
-			ctx->cpdoms_match[ctx->i_m] = cpuc->cpdom_id;
-			ctx->cpus_match[ctx->i_m] = cpu;
-			ctx->i_m++;
+			ctx->cpdoms_match[i_m] = cpuc->cpdom_id;
+			ctx->cpus_match[i_m] = cpu;
+			ctx->i_m = i_m + 1;
 		}
 		else {
-			ctx->cpdoms_not_match[ctx->i_m] = cpuc->cpdom_alt_id;
-			ctx->cpus_not_match[ctx->i_nm] = cpu;
-			ctx->i_nm++;
+			ctx->cpdoms_not_match[i_nm] = cpuc->cpdom_alt_id;
+			ctx->cpus_not_match[i_nm] = cpu;
+			ctx->i_nm = i_nm + 1;
 		}
 		return true;
 	}
