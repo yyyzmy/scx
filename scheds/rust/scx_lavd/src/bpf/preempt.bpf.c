@@ -90,7 +90,7 @@ static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 	 */
 	struct cpu_ctx *cpuc;
 	struct preemption_info prm_task, prm_cpus[2], *victim_cpu;
-	int cpu, nr_cpus;
+	int cpu;
 	int i, v = 0;
 	int ret;
 
@@ -119,8 +119,7 @@ static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 	 * be too expensive to perform every task queue. We need to revisit
 	 * this if the traversal cost becomes problematic.
 	 */
-	nr_cpus = bpf_cpumask_weight(cpumask);
-	bpf_for(i, 0, nr_cpus) {
+	bpf_for(i, 0, nr_cpu_ids) {
 
 		/*
 		 * Decide a CPU ID to examine.
