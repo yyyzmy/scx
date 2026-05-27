@@ -121,17 +121,25 @@ fn build_cpdoms(topo: &Topology) -> BTreeMap<CpdomKey, Cpdom> {
         }
     }
 
+    let mut neighbor_data: BTreeMap<CpdomKey, BTreeMap<usize, Vec<usize>>> = BTreeMap::new();
     for (from_k, from_v) in cpdom_map.iter() {
         for (to_k, to_v) in cpdom_map.iter() {
             if from_k == to_k {
                 continue;
             }
             let d = cpdom_dist(from_k, to_k);
-            from_v
-                .neighbor_map
+            neighbor_data
+                .entry(from_k.clone())
+                .or_default()
                 .entry(d)
                 .or_default()
                 .push(to_v.cpdom_id);
+        }
+    }
+
+    for (k, cpdom) in cpdom_map.iter_mut() {
+        if let Some(neighbors) = neighbor_data.remove(k) {
+            cpdom.neighbor_map = neighbors;
         }
     }
 
@@ -177,7 +185,7 @@ struct Opts {
 }
 
 struct Scheduler<'a> {
-    skel: TraeSkel<'a>,
+    skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
 }
 
@@ -207,7 +215,7 @@ impl<'a> Scheduler<'a> {
             );
         }
 
-        let mut skel_builder = TraeSkelBuilder::default();
+        let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.open_object(open_object);
 
         let mut skel = scx_ops_open!(skel_builder, open_object, trae_ops, None)?;
