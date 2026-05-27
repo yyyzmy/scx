@@ -368,6 +368,12 @@ static int init_cpdoms(void)
 		}
 	}
 
+	err = scx_bpf_create_dsq(TRAE_GLOBAL_DSQ, -1);
+	if (err) {
+		scx_bpf_error("Failed to create global DSQ");
+		return err;
+	}
+
 	return 0;
 }
 
@@ -478,7 +484,7 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 
 	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, slice_max_ns, enq_flags);
+		scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
 		return;
 	}
 
@@ -514,20 +520,20 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 		bpf_rcu_read_unlock();
 	}
 
-	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, slice_max_ns, enq_flags);
+	scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
 }
 
 void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct cpu_ctx *cpuc;
-	struct cpdom_ctx *cpdomc;
+	struct cpdom_ctx *cpdomc, *ncpdomc;
 	u64 dsq_id;
 	int d, i;
 	s64 nr_nbr, nid;
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
-		scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL, 0);
+		scx_bpf_dsq_move_to_local(TRAE_GLOBAL_DSQ, 0);
 		return;
 	}
 
@@ -535,7 +541,7 @@ void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 	if (scx_bpf_dsq_move_to_local(dsq_id, 0))
 		return;
 
-	if (scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL, 0))
+	if (scx_bpf_dsq_move_to_local(TRAE_GLOBAL_DSQ, 0))
 		return;
 
 	cpdomc = get_cpdom_ctx(cpuc->cpdom_id);
@@ -553,6 +559,10 @@ void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 
 			nid = get_neighbor_id(cpdomc, d, i);
 			if (nid < 0)
+				continue;
+
+			ncpdomc = get_cpdom_ctx((u32)nid);
+			if (!ncpdomc || !ncpdomc->is_valid)
 				continue;
 
 			dsq_id = dom_to_dsq((u32)nid);
