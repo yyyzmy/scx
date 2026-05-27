@@ -458,6 +458,11 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 	u32 cpdom_id;
 	u64 dsq_id;
 
+	if (p->flags & PF_KTHREAD) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, enq_flags);
+		return;
+	}
+
 	cpuc = get_cpu_ctx();
 	if (!cpuc) {
 		scx_bpf_dsq_insert(p, dom_to_dsq(0), slice_max_ns, enq_flags);
