@@ -719,4 +719,5 @@ SCX_OPS_DEFINE(trae_ops,
 	       .init			= (void *)trae_init,
 	       .exit			= (void *)trae_exit,
 	       .timeout_ms		= 30000U,
-	       .name			= "trae");
+	       .name			= "trae",
+	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE);
