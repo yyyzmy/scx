@@ -153,7 +153,7 @@ static struct sys_stat *get_sys_stat(void)
 	return bpf_map_lookup_elem(&sys_stat_stor, &idx);
 }
 
-static u64 time_delta(u64 now, u64 prev)
+static u64 trae_time_delta(u64 now, u64 prev)
 {
 	return now > prev ? now - prev : 0;
 }
@@ -223,7 +223,6 @@ static int init_per_cpu_ctx(void)
 	struct bpf_cpumask *active, *ovrflw, *big, *cd_cpumask;
 	struct cpu_ctx *cpuc;
 	int cpu, i, j, k, err = 0;
-	u64 sum_capacity = 0, big_capacity = 0;
 
 	bpf_rcu_read_lock();
 	online_cpumask = scx_bpf_get_online_cpumask();
@@ -268,10 +267,7 @@ static int init_per_cpu_ctx(void)
 		cpuc->big_core = cpu_big[cpu];
 		cpuc->est_stopping_clk = 0;
 
-		sum_capacity += cpuc->max_capacity;
-
 		if (cpuc->big_core) {
-			big_capacity += cpuc->max_capacity;
 			bpf_cpumask_set_cpu(cpu, big);
 		}
 
@@ -389,15 +385,15 @@ static int init_sys_stat(void)
 	if (!timer)
 		return -EINVAL;
 
-	err = bpf_timer_init(timer, &update_timer, CLOCK_MONOTONIC);
+	err = bpf_timer_init(&timer->timer, &update_timer, CLOCK_MONOTONIC);
 	if (err)
 		return err;
 
-	err = bpf_timer_set_callback(timer, update_timer_cb);
+	err = bpf_timer_set_callback(&timer->timer, update_timer_cb);
 	if (err)
 		return err;
 
-	err = bpf_timer_start(timer, 10000000ULL, 0);
+	err = bpf_timer_start(&timer->timer, 10000000ULL, 0);
 	return err;
 }
 
@@ -434,7 +430,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bpf_cpumask_and(i_cpumask, cast_mask(a_cpumask), idle_cpumask);
 
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
-		cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask));
+		cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
 		if (cpu_id >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 			scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -444,7 +440,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
-		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask));
+		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask), 0);
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -508,7 +504,7 @@ void BPF_STRUCT_OPS(trae_stopping, struct task_struct *p, bool runnable)
 		return;
 
 	now = scx_bpf_now();
-	dur = time_delta(now, cpuc->est_stopping_clk);
+	dur = trae_time_delta(now, cpuc->est_stopping_clk);
 
 	cpuc->tot_task_time_wall += dur;
 	cpuc->est_stopping_clk = 0;
@@ -578,7 +574,7 @@ void BPF_STRUCT_OPS(trae_update_idle, s32 cpu, bool idle)
 	} else {
 		cpuc->is_idle = false;
 		if (cpuc->idle_start_clk) {
-			u64 dur = time_delta(scx_bpf_now(), cpuc->idle_start_clk);
+			u64 dur = trae_time_delta(scx_bpf_now(), cpuc->idle_start_clk);
 			__sync_fetch_and_add(&cpuc->idle_total_wall, dur);
 			cpuc->idle_start_clk = 0;
 		}
