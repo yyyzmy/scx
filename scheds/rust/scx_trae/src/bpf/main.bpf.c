@@ -18,6 +18,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+#define min(X, Y) (((X) < (Y)) ? (X) : (Y))
+
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
@@ -495,9 +497,10 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (nr_cpdoms > 0) {
 		int i;
+		u32 limit = min(nr_cpdoms, TRAE_CPDOM_MAX_NR);
 		bpf_rcu_read_lock();
-		bpf_for(i, 0, nr_cpdoms) {
-			if (i >= TRAE_CPDOM_MAX_NR)
+		for (i = 0; i < TRAE_CPDOM_MAX_NR; i++) {
+			if (i >= limit)
 				break;
 			cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [i]);
 			if (!cd_cpumask)
@@ -519,7 +522,8 @@ void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 	struct cpu_ctx *cpuc;
 	struct cpdom_ctx *cpdomc;
 	u64 dsq_id;
-	int i, d, n;
+	int d, i;
+	s64 nr_nbr, nid;
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
@@ -538,14 +542,19 @@ void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 	if (!cpdomc)
 		return;
 
-	bpf_for(d, 0, TRAE_CPDOM_MAX_DIST) {
-		n = cpdomc->nr_neighbors[d];
-		bpf_for(i, 0, n) {
-			if (i >= TRAE_CPDOM_MAX_NR_PER_DIST)
+	for (d = 0; d < TRAE_CPDOM_MAX_DIST; d++) {
+		nr_nbr = min(cpdomc->nr_neighbors[d], TRAE_CPDOM_MAX_NR_PER_DIST);
+		if (nr_nbr == 0)
+			break;
+
+		for (i = 0; i < TRAE_CPDOM_MAX_NR_PER_DIST; i++) {
+			if (i >= nr_nbr)
 				break;
-			s64 nid = get_neighbor_id(cpdomc, d, i);
+
+			nid = get_neighbor_id(cpdomc, d, i);
 			if (nid < 0)
 				continue;
+
 			dsq_id = dom_to_dsq((u32)nid);
 			if (scx_bpf_dsq_move_to_local(dsq_id, 0))
 				return;
