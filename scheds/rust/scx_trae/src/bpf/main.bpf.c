@@ -411,7 +411,12 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *cd_cpumask, *a_cpumask, *i_cpumask;
 	const struct cpumask *idle_cpumask;
-	s32 cpu_id = prev_cpu;
+	s32 cpu_id = -1;
+
+	if (p->flags & PF_KTHREAD) {
+		cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
+		return cpu_id >= 0 ? cpu_id : prev_cpu;
+	}
 
 	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc)
@@ -449,45 +454,103 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	scx_bpf_put_idle_cpumask(idle_cpumask);
 	bpf_rcu_read_unlock();
 
+	if (cpu_id >= 0)
+		return cpu_id;
+
+	cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
 	return cpu_id >= 0 ? cpu_id : prev_cpu;
 }
 
 void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc;
+	struct bpf_cpumask *cd_cpumask;
 	u32 cpdom_id;
 	u64 dsq_id;
+	s32 prev_cpu = scx_bpf_task_cpu(p);
 
 	if (p->flags & PF_KTHREAD) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, enq_flags);
 		return;
 	}
 
-	cpuc = get_cpu_ctx();
+	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc) {
-		scx_bpf_dsq_insert(p, dom_to_dsq(0), slice_max_ns, enq_flags);
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, slice_max_ns, enq_flags);
 		return;
 	}
 
 	cpdom_id = cpuc->cpdom_id;
-	dsq_id = dom_to_dsq(cpdom_id);
 
-	scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
+	bpf_rcu_read_lock();
+	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
+	if (cd_cpumask &&
+	    bpf_cpumask_intersects(cast_mask(cd_cpumask), p->cpus_ptr)) {
+		bpf_rcu_read_unlock();
+		dsq_id = dom_to_dsq(cpdom_id);
+		scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
+		return;
+	}
+	bpf_rcu_read_unlock();
+
+	if (nr_cpdoms > 0) {
+		int i;
+		bpf_rcu_read_lock();
+		bpf_for(i, 0, nr_cpdoms) {
+			if (i >= TRAE_CPDOM_MAX_NR)
+				break;
+			cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [i]);
+			if (!cd_cpumask)
+				continue;
+			if (bpf_cpumask_intersects(cast_mask(cd_cpumask), p->cpus_ptr)) {
+				bpf_rcu_read_unlock();
+				scx_bpf_dsq_insert(p, dom_to_dsq(i), slice_max_ns, enq_flags);
+				return;
+			}
+		}
+		bpf_rcu_read_unlock();
+	}
+
+	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, slice_max_ns, enq_flags);
 }
 
 void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct cpu_ctx *cpuc;
+	struct cpdom_ctx *cpdomc;
 	u64 dsq_id;
+	int i, d, n;
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
-		scx_bpf_dsq_move_to_local(dom_to_dsq(0), 0);
+		scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL, 0);
 		return;
 	}
 
 	dsq_id = dom_to_dsq(cpuc->cpdom_id);
-	scx_bpf_dsq_move_to_local(dsq_id, 0);
+	if (scx_bpf_dsq_move_to_local(dsq_id, 0))
+		return;
+
+	if (scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL, 0))
+		return;
+
+	cpdomc = get_cpdom_ctx(cpuc->cpdom_id);
+	if (!cpdomc)
+		return;
+
+	bpf_for(d, 0, TRAE_CPDOM_MAX_DIST) {
+		n = cpdomc->nr_neighbors[d];
+		bpf_for(i, 0, n) {
+			if (i >= TRAE_CPDOM_MAX_NR_PER_DIST)
+				break;
+			s64 nid = get_neighbor_id(cpdomc, d, i);
+			if (nid < 0)
+				continue;
+			dsq_id = dom_to_dsq((u32)nid);
+			if (scx_bpf_dsq_move_to_local(dsq_id, 0))
+				return;
+		}
+	}
 }
 
 void BPF_STRUCT_OPS(trae_running, struct task_struct *p)
