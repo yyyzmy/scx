@@ -10,6 +10,7 @@
  *   - Per-cpdom DSQ creation on associated NUMA node
  */
 #include <scx/common.bpf.h>
+#include <scx/user_exit_info.bpf.h>
 #include "intf.h"
 #include <errno.h>
 #include <stdbool.h>
@@ -18,6 +19,8 @@
 #include <bpf/bpf_tracing.h>
 
 char _license[] SEC("license") = "GPL";
+
+UEI_DEFINE(uei);
 
 const volatile u32 nr_cpu_ids;
 const volatile u32 nr_cpus_onln;
@@ -696,6 +699,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(trae_init)
 
 void BPF_STRUCT_OPS(trae_exit, struct scx_exit_info *ei)
 {
+	UEI_RECORD(uei, ei);
 }
 
 SCX_OPS_DEFINE(trae_ops,

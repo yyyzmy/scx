@@ -122,7 +122,7 @@ fn build_cpdoms(topo: &Topology) -> BTreeMap<CpdomKey, Cpdom> {
     }
 
     let mut neighbor_data: BTreeMap<CpdomKey, BTreeMap<usize, Vec<usize>>> = BTreeMap::new();
-    for (from_k, from_v) in cpdom_map.iter() {
+    for (from_k, _from_v) in cpdom_map.iter() {
         for (to_k, to_v) in cpdom_map.iter() {
             if from_k == to_k {
                 continue;
@@ -216,7 +216,6 @@ impl<'a> Scheduler<'a> {
         }
 
         let mut skel_builder = BpfSkelBuilder::default();
-        skel_builder.obj_builder.open_object(open_object);
 
         let mut skel = scx_ops_open!(skel_builder, open_object, trae_ops, None)?;
 
