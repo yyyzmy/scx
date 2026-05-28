@@ -446,7 +446,11 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bpf_cpumask_and(i_cpumask, cast_mask(a_cpumask), idle_cpumask);
 
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
-		cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
+		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
+			cpu_id = prev_cpu;
+		} else {
+			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
+		}
 		if (cpu_id >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 			scx_bpf_put_idle_cpumask(idle_cpumask);
