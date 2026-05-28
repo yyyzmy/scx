@@ -480,18 +480,25 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *cd_cpumask;
+	struct sys_stat *ss;
 	u32 cpdom_id;
 	u64 dsq_id;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 
 	if (p->flags & PF_KTHREAD) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, enq_flags);
+		ss = get_sys_stat();
+		if (ss)
+			__sync_fetch_and_add(&ss->nr_enqueue_local, 1);
 		return;
 	}
 
 	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc) {
 		scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
+		ss = get_sys_stat();
+		if (ss)
+			__sync_fetch_and_add(&ss->nr_enqueue_global, 1);
 		return;
 	}
 
@@ -504,6 +511,9 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 		bpf_rcu_read_unlock();
 		dsq_id = dom_to_dsq(cpdom_id);
 		scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
+		ss = get_sys_stat();
+		if (ss)
+			__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
 		return;
 	}
 	bpf_rcu_read_unlock();
@@ -521,6 +531,9 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 			if (bpf_cpumask_intersects(cast_mask(cd_cpumask), p->cpus_ptr)) {
 				bpf_rcu_read_unlock();
 				scx_bpf_dsq_insert(p, dom_to_dsq(i), slice_max_ns, enq_flags);
+				ss = get_sys_stat();
+				if (ss)
+					__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
 				return;
 			}
 		}
@@ -528,6 +541,9 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
+	ss = get_sys_stat();
+	if (ss)
+		__sync_fetch_and_add(&ss->nr_enqueue_global, 1);
 }
 
 void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)

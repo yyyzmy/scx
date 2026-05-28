@@ -429,10 +429,15 @@ impl<'a> Scheduler<'a> {
             let nr_nonidle = ss.nr_nonidle_select;
             let total = nr_idle + nr_nonidle;
             let idle_pct = if total > 0 { (nr_idle * 100) / total } else { 0 };
+            let nr_local = ss.nr_enqueue_local;
+            let nr_cpdom = ss.nr_enqueue_cpdom;
+            let nr_global = ss.nr_enqueue_global;
+            let enqueue_total = nr_local + nr_cpdom + nr_global;
 
-            println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2} | select: idle={:6} nonidle={:6} ({:3}% idle)",
+            println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2} | select: idle={:6} nonidle={:6} ({:3}% idle) | enqueue: local={:6} cpdom={:6} global={:6}",
                      tick, util, nr_active, nr_q, nr_active_cpdoms, nr_stealee,
-                     nr_idle, nr_nonidle, idle_pct);
+                     nr_idle, nr_nonidle, idle_pct,
+                     nr_local, nr_cpdom, nr_global);
         }
 
         self.struct_ops.take();

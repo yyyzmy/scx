@@ -45,6 +45,9 @@ struct sys_stat {
 	u64	last_update_clk;
 	u64	nr_idle_select;
 	u64	nr_nonidle_select;
+	u64	nr_enqueue_local;
+	u64	nr_enqueue_cpdom;
+	u64	nr_enqueue_global;
 };
 
 #endif /* __INTF_H */
