@@ -405,10 +405,30 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
+        let mut tick = 0u64;
+
         while !shutdown.load(Ordering::Relaxed)
             && !uei_exited!(&self.skel, uei)
         {
             std::thread::sleep(std::time::Duration::from_secs(1));
+            tick += 1;
+
+            let bss = self.skel.maps.bss_data.as_ref().unwrap();
+            let ss = &bss.sys_stat;
+
+            let util = ss.avg_util_wall;
+            let nr_active = ss.nr_active;
+            let nr_q = ss.nr_queued_task;
+            let nr_active_cpdoms = ss.nr_active_cpdoms;
+            let nr_stealee = ss.nr_stealee;
+            let nr_idle = ss.nr_idle_select;
+            let nr_nonidle = ss.nr_nonidle_select;
+            let total = nr_idle + nr_nonidle;
+            let idle_pct = if total > 0 { (nr_idle * 100) / total } else { 0 };
+
+            println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2} | select: idle={:6} nonidle={:6} ({:3}% idle)",
+                     tick, util, nr_active, nr_q, nr_active_cpdoms, nr_stealee,
+                     nr_idle, nr_nonidle, idle_pct);
         }
 
         self.struct_ops.take();

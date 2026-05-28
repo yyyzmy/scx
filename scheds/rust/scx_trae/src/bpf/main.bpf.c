@@ -100,6 +100,8 @@ struct sys_stat {
 	u32	nr_active_cpdoms;
 	u32	nr_stealee;
 	u64	last_update_clk;
+	u64	nr_idle_select;
+	u64	nr_nonidle_select;
 };
 
 struct {
@@ -452,6 +454,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
 		}
 		if (cpu_id >= 0) {
+			__sync_fetch_and_add(&get_sys_stat()->nr_idle_select, 1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 			scx_bpf_put_idle_cpumask(idle_cpumask);
 			bpf_rcu_read_unlock();
@@ -461,6 +464,8 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
 		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask), 0);
+		if (cpu_id >= 0)
+			__sync_fetch_and_add(&get_sys_stat()->nr_nonidle_select, 1);
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
