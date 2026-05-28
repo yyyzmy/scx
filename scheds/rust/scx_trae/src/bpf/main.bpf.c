@@ -102,14 +102,19 @@ struct sys_stat {
 	u64	last_update_clk;
 };
 
-struct sys_stat sys_stat;
-
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, struct cpu_ctx);
 	__uint(max_entries, 1);
 } cpu_ctx_stor SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct sys_stat);
+	__uint(max_entries, 1);
+} sys_stat_stor SEC(".maps");
 
 struct update_timer {
 	struct bpf_timer timer;
@@ -149,7 +154,8 @@ static struct cpdom_ctx *get_cpdom_ctx(u32 cpdom_id)
 
 static struct sys_stat *get_sys_stat(void)
 {
-	return &sys_stat;
+	const u32 idx = 0;
+	return bpf_map_lookup_elem(&sys_stat_stor, &idx);
 }
 
 static u64 trae_time_delta(u64 now, u64 prev)
@@ -440,11 +446,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bpf_cpumask_and(i_cpumask, cast_mask(a_cpumask), idle_cpumask);
 
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
-		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
-			cpu_id = prev_cpu;
-		} else {
-			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
-		}
+		cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
 		if (cpu_id >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 			scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -691,16 +693,12 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 	struct cpdom_ctx *cpdomc;
 	u64 now, total_wall = 0, total_idle = 0;
 	u32 nr_active = 0, nr_active_cpdoms = 0, nr_stealee = 0;
-	u32 total_q = 0;
 	int cpu, i;
 
 	if (!ss)
 		goto out;
 
 	now = scx_bpf_now();
-
-	if (ss->last_update_clk)
-		ss->slice_wall = trae_time_delta(now, ss->last_update_clk);
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu >= TRAE_CPU_ID_MAX)
@@ -736,9 +734,6 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 		if (cpdomc->nr_active_cpus > 0)
 			nr_active_cpdoms++;
 
-		cpdomc->nr_queued_task = scx_bpf_dsq_nr_queued(dom_to_dsq(cpdomc->id));
-		total_q += cpdomc->nr_queued_task;
-
 		cpdomc->is_stealer = false;
 		cpdomc->is_stealee = false;
 
@@ -754,7 +749,6 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 			nr_stealee++;
 	}
 
-	ss->nr_queued_task = total_q;
 	ss->nr_active_cpdoms = nr_active_cpdoms;
 	ss->nr_stealee = nr_stealee;
 	ss->last_update_clk = now;

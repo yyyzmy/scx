@@ -405,48 +405,10 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
-        let mut tick = 0u64;
-
         while !shutdown.load(Ordering::Relaxed)
             && !uei_exited!(&self.skel, uei)
         {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            tick += 1;
-
-            let bss = self.skel.maps.bss_data.as_ref().unwrap();
-            let ss = &bss.sys_stat;
-
-            let util = ss.avg_util_wall;
-            let nr_active = ss.nr_active;
-            let nr_q = ss.nr_queued_task;
-            let nr_active_cpdoms = ss.nr_active_cpdoms;
-            let nr_stealee = ss.nr_stealee;
-
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2} |",
-                     tick, util, nr_active, nr_q, nr_active_cpdoms, nr_stealee);
-
-            for i in 0..bss.cpdom_ctxs.len() {
-                let c = &bss.cpdom_ctxs[i];
-                if c.is_valid == 0 {
-                    continue;
-                }
-                let core = if c.is_big != 0 { "B" } else { "L" };
-                let role = if c.is_stealee != 0 {
-                    "STEALEE"
-                } else if c.is_stealer != 0 {
-                    "STEALER"
-                } else {
-                    "  -    "
-                };
-                println!("       cpdom{:3} [N{}L{}{}] acpus={:2} queued={:3} {}",
-                         c.id, c.numa_id, c.llc_id, core,
-                         c.nr_active_cpus, c.nr_queued_task, role);
-            }
         }
 
         self.struct_ops.take();
