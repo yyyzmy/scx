@@ -51,6 +51,14 @@ struct sys_stat {
 	u32	nr_stealee;
 	u32	nr_active;
 	u32	nr_active_cpdoms;
+	u64	nr_sched;
+	u64	nr_preempt;
+	u64	nr_perf_cri;
+	u64	nr_lat_cri;
+	u64	nr_x_migration;
+	u64	nr_big;
+	u64	nr_pc_on_big;
+	u64	nr_lc_on_big;
 	u64	nr_idle_select;
 	u64	nr_nonidle_select;
 	u64	nr_enqueue_local;
