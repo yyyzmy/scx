@@ -408,6 +408,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *cd_cpumask, *a_cpumask, *i_cpumask;
 	const struct cpumask *idle_cpumask;
+	struct sys_stat *ss;
 	s32 cpu_id = -1;
 
 	if (p->flags & PF_KTHREAD) {
@@ -418,6 +419,8 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc)
 		return prev_cpu;
+
+	ss = get_sys_stat();
 
 	bpf_rcu_read_lock();
 
@@ -441,7 +444,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
 		}
 		if (cpu_id >= 0) {
-			__sync_fetch_and_add(&get_sys_stat()->nr_idle_select, 1);
+			__sync_fetch_and_add(&ss->nr_idle_select, 1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 			scx_bpf_put_idle_cpumask(idle_cpumask);
 			bpf_rcu_read_unlock();
@@ -452,7 +455,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
 		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask), 0);
 		if (cpu_id >= 0)
-			__sync_fetch_and_add(&get_sys_stat()->nr_nonidle_select, 1);
+			__sync_fetch_and_add(&ss->nr_nonidle_select, 1);
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
