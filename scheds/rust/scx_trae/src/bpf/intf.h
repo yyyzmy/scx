@@ -35,6 +35,7 @@ typedef unsigned long long u64;
 #define TRAE_GLOBAL_DSQ		((u64)TRAE_DSQ_TYPE_GLOBAL << TRAE_DSQ_TYPE_SHFT)
 
 struct sys_stat {
+	u64	last_update_clk;
 	u64	avg_util_wall;
 	u64	avg_util_invr;
 	u64	slice_wall;
@@ -42,7 +43,6 @@ struct sys_stat {
 	u32	nr_active;
 	u32	nr_active_cpdoms;
 	u32	nr_stealee;
-	u64	last_update_clk;
 	u64	nr_idle_select;
 	u64	nr_nonidle_select;
 	u64	nr_enqueue_local;
