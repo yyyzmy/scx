@@ -414,7 +414,10 @@ impl<'a> Scheduler<'a> {
             tick += 1;
 
             let bss = self.skel.maps.bss_data.as_ref().unwrap();
-            let ss = &bss.sys_stat;
+            let ss: &bpf_intf::sys_stat = match self.skel.maps.sys_stat_stor.lookup(&0u32.to_ne_bytes()) {
+                Ok(Some(s)) => unsafe { &*(s.as_ptr() as *const bpf_intf::sys_stat) },
+                _ => panic!("Failed to lookup sys_stat"),
+            };
 
             let util = ss.avg_util_wall;
             let nr_active = ss.nr_active;
