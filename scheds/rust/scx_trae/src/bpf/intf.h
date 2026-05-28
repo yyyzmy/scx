@@ -2,6 +2,16 @@
 #ifndef __INTF_H
 #define __INTF_H
 
+#include <stdbool.h>
+#ifndef __KERNEL__
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef int s32;
+typedef unsigned u32;
+typedef long long s64;
+typedef unsigned long long u64;
+#endif
+
 #define CACHELINE_SIZE		64
 
 #define TRAE_CPU_ID_MAX		512
