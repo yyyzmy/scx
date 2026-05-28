@@ -91,19 +91,6 @@ struct cpu_ctx {
 	struct bpf_cpumask __kptr *tmp_t2_mask;
 };
 
-struct sys_stat {
-	u64	avg_util_wall;
-	u64	avg_util_invr;
-	u64	slice_wall;
-	u32	nr_queued_task;
-	u32	nr_active;
-	u32	nr_active_cpdoms;
-	u32	nr_stealee;
-	u64	last_update_clk;
-	u64	nr_idle_select;
-	u64	nr_nonidle_select;
-};
-
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
