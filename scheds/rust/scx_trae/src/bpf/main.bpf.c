@@ -579,23 +579,17 @@ void BPF_STRUCT_OPS(trae_running, struct task_struct *p)
 		return;
 
 	cpuc->is_idle = false;
-	cpuc->est_stopping_clk = scx_bpf_now();
 }
 
 void BPF_STRUCT_OPS(trae_stopping, struct task_struct *p, bool runnable)
 {
 	struct cpu_ctx *cpuc;
-	u64 now, dur;
 
 	cpuc = get_cpu_ctx();
 	if (!cpuc)
 		return;
 
-	now = scx_bpf_now();
-	dur = trae_time_delta(now, cpuc->est_stopping_clk);
-
-	cpuc->tot_task_time_wall += dur;
-	cpuc->est_stopping_clk = 0;
+	cpuc->tot_task_time_wall = 1;
 }
 
 void BPF_STRUCT_OPS(trae_tick, struct task_struct *p)
@@ -656,17 +650,7 @@ void BPF_STRUCT_OPS(trae_update_idle, s32 cpu, bool idle)
 	if (!cpuc)
 		return;
 
-	if (idle) {
-		cpuc->is_idle = true;
-		cpuc->idle_start_clk = scx_bpf_now();
-	} else {
-		cpuc->is_idle = false;
-		if (cpuc->idle_start_clk) {
-			u64 dur = trae_time_delta(scx_bpf_now(), cpuc->idle_start_clk);
-			__sync_fetch_and_add(&cpuc->idle_total_wall, dur);
-			cpuc->idle_start_clk = 0;
-		}
-	}
+	cpuc->is_idle = idle;
 }
 
 void BPF_STRUCT_OPS(trae_set_cpumask, struct task_struct *p,
@@ -689,19 +673,11 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 	struct sys_stat *ss = get_sys_stat();
 	struct cpu_ctx *cpuc;
 	struct cpdom_ctx *cpdomc;
-	u64 now, duration_wall, duration_total_wall, total_idle = 0;
-	u64 compute_total_wall;
 	u32 nr_active = 0, nr_active_cpdoms = 0, nr_stealee = 0;
 	int cpu, i;
 
 	if (!ss)
 		goto out;
-
-	now = scx_bpf_now();
-	duration_wall = trae_time_delta(now, ss->last_update_clk) ? : 1;
-	WRITE_ONCE(ss->last_update_clk, now);
-
-	duration_total_wall = (duration_wall * nr_cpus_onln) ? : 1;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu >= TRAE_CPU_ID_MAX)
@@ -711,15 +687,9 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 		if (!cpuc || !cpuc->is_online)
 			continue;
 
-		total_idle += cpuc->idle_total_wall;
-		cpuc->idle_total_wall = 0;
-
-		if (cpuc->tot_task_time_wall > 0)
+		if (!cpuc->is_idle)
 			nr_active++;
 	}
-
-	compute_total_wall = time_delta(duration_total_wall, total_idle) ? : 1;
-	ss->avg_util_wall = (compute_total_wall * 100) / duration_total_wall;
 
 	ss->nr_active = nr_active;
 
