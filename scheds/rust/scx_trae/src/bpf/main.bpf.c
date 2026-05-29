@@ -726,7 +726,7 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 	duration_wall = trae_time_delta(now, ss->last_update_clk) ? : 1;
 	WRITE_ONCE(ss->last_update_clk, now);
 
-	duration_total_wall = duration_wall;
+	duration_total_wall = (duration_wall * nr_cpus_onln) ? : 1;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu >= TRAE_CPU_ID_MAX)
