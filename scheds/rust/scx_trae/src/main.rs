@@ -187,11 +187,7 @@ struct Opts {
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
-if (bpf_cpumask_test_cpu(cpu, online_cpumask)) {
-    bpf_cpumask_set_cpu(cpu, cd_cpumask);
-    cpdomc->nr_active_cpus++;           // 该cpdom下online的CPU数量
-    cpdomc->cap_sum_active_cpus += cpuc->effective_capacity;
-}    nr_cpus_onln: u64,
+    nr_cpus_onln: u64,
     struct_ops: Option<libbpf_rs::Link>,
 }
 
@@ -424,7 +420,7 @@ impl<'a> Scheduler<'a> {
 
             let bss = self.skel.maps.bss_data.as_ref().unwrap();
             let ss: &bpf_intf::sys_stat = match self.skel.maps.sys_stat_stor.lookup(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY) {
-                Ok(Some(s)) => unsafe { &*(s.as_ptr() as *const bpf_intf::sys_stat) },
+                Ok(Some(s)) => unsafe { &*(s.as_ptr() as *const _ as *const bpf_intf::sys_stat) },
                 _ => panic!("Failed to lookup sys_stat"),
             };
 
