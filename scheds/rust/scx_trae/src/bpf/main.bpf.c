@@ -479,7 +479,6 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc;
-	struct bpf_cpumask *cd_cpumask;
 	struct sys_stat *ss;
 	u32 cpdom_id;
 	u64 dsq_id;
@@ -503,47 +502,11 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	cpdom_id = cpuc->cpdom_id;
-
-	bpf_rcu_read_lock();
-	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
-	if (cd_cpumask &&
-	    bpf_cpumask_intersects(cast_mask(cd_cpumask), p->cpus_ptr)) {
-		bpf_rcu_read_unlock();
-		dsq_id = dom_to_dsq(cpdom_id);
-		scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
-		ss = get_sys_stat();
-		if (ss)
-			__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
-		return;
-	}
-	bpf_rcu_read_unlock();
-
-	if (nr_cpdoms > 0) {
-		int i;
-		u32 limit = min(nr_cpdoms, TRAE_CPDOM_MAX_NR);
-		bpf_rcu_read_lock();
-		for (i = 0; i < TRAE_CPDOM_MAX_NR; i++) {
-			if (i >= limit)
-				break;
-			cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [i]);
-			if (!cd_cpumask)
-				continue;
-			if (bpf_cpumask_intersects(cast_mask(cd_cpumask), p->cpus_ptr)) {
-				bpf_rcu_read_unlock();
-				scx_bpf_dsq_insert(p, dom_to_dsq(i), slice_max_ns, enq_flags);
-				ss = get_sys_stat();
-				if (ss)
-					__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
-				return;
-			}
-		}
-		bpf_rcu_read_unlock();
-	}
-
-	scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
+	dsq_id = dom_to_dsq(cpdom_id);
+	scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
 	ss = get_sys_stat();
 	if (ss)
-		__sync_fetch_and_add(&ss->nr_enqueue_global, 1);
+		__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
 }
 
 void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
