@@ -187,6 +187,7 @@ struct Opts {
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
+    nr_cpus_onln: u64,
     struct_ops: Option<libbpf_rs::Link>,
 }
 
@@ -293,12 +294,15 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        let nr_cpus_onln = topo.all_cpus.len() as u64;
+
         let mut skel = scx_ops_load!(skel, trae_ops, uei)?;
 
         let struct_ops = Some(scx_ops_attach!(skel, trae_ops)?);
 
         Ok(Self {
             skel,
+            nr_cpus_onln,
             struct_ops,
         })
     }
@@ -420,8 +424,12 @@ impl<'a> Scheduler<'a> {
                 _ => panic!("Failed to lookup sys_stat"),
             };
 
-            let util = ss.avg_util_wall;
-            let nr_active = ss.nr_active;
+            let nr_active = ss.nr_active as u64;
+            let util = if self.nr_cpus_onln > 0 {
+                (nr_active * 100) / self.nr_cpus_onln
+            } else {
+                0
+            };
             let nr_q = ss.nr_queued_task;
             let nr_active_cpdoms = ss.nr_active_cpdoms;
             let nr_stealee = ss.nr_stealee;
