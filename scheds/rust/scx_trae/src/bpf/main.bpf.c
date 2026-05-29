@@ -408,9 +408,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *cd_cpumask, *a_cpumask, *i_cpumask;
 	const struct cpumask *idle_cpumask;
-	struct sys_stat *ss;
 	s32 cpu_id = -1;
-	bool idle_path = false;
 
 	if (p->flags & PF_KTHREAD) {
 		cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
@@ -443,31 +441,34 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
 		}
 		if (cpu_id >= 0) {
-			idle_path = true;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 			scx_bpf_put_idle_cpumask(idle_cpumask);
 			bpf_rcu_read_unlock();
-			ss = get_sys_stat();
-			if (ss)
-				__sync_fetch_and_add(&ss->nr_idle_select, 1);
+#ifdef TRAE_STATS
+			{
+				struct sys_stat *ss = get_sys_stat();
+				if (ss)
+					__sync_fetch_and_add(&ss->nr_idle_select, 1);
+			}
+#endif
 			return cpu_id;
 		}
 	}
 
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
 		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask), 0);
-		if (cpu_id >= 0)
-			idle_path = false;
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
 	bpf_rcu_read_unlock();
 
-	if (cpu_id >= 0 && !idle_path) {
-		ss = get_sys_stat();
+#ifdef TRAE_STATS
+	if (cpu_id >= 0) {
+		struct sys_stat *ss = get_sys_stat();
 		if (ss)
 			__sync_fetch_and_add(&ss->nr_nonidle_select, 1);
 	}
+#endif
 
 	if (cpu_id >= 0)
 		return cpu_id;
@@ -479,34 +480,45 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc;
-	struct sys_stat *ss;
 	u32 cpdom_id;
 	u64 dsq_id;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 
 	if (p->flags & PF_KTHREAD) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, enq_flags);
-		ss = get_sys_stat();
-		if (ss)
-			__sync_fetch_and_add(&ss->nr_enqueue_local, 1);
+#ifdef TRAE_STATS
+		{
+			struct sys_stat *ss = get_sys_stat();
+			if (ss)
+				__sync_fetch_and_add(&ss->nr_enqueue_local, 1);
+		}
+#endif
 		return;
 	}
 
 	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc) {
 		scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
-		ss = get_sys_stat();
-		if (ss)
-			__sync_fetch_and_add(&ss->nr_enqueue_global, 1);
+#ifdef TRAE_STATS
+		{
+			struct sys_stat *ss = get_sys_stat();
+			if (ss)
+				__sync_fetch_and_add(&ss->nr_enqueue_global, 1);
+		}
+#endif
 		return;
 	}
 
 	cpdom_id = cpuc->cpdom_id;
 	dsq_id = dom_to_dsq(cpdom_id);
 	scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
-	ss = get_sys_stat();
-	if (ss)
-		__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
+#ifdef TRAE_STATS
+	{
+		struct sys_stat *ss = get_sys_stat();
+		if (ss)
+			__sync_fetch_and_add(&ss->nr_enqueue_cpdom, 1);
+	}
+#endif
 }
 
 void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)

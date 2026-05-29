@@ -187,7 +187,11 @@ struct Opts {
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
-    nr_cpus_onln: u64,
+if (bpf_cpumask_test_cpu(cpu, online_cpumask)) {
+    bpf_cpumask_set_cpu(cpu, cd_cpumask);
+    cpdomc->nr_active_cpus++;           // 该cpdom下online的CPU数量
+    cpdomc->cap_sum_active_cpus += cpuc->effective_capacity;
+}    nr_cpus_onln: u64,
     struct_ops: Option<libbpf_rs::Link>,
 }
 
@@ -433,19 +437,26 @@ impl<'a> Scheduler<'a> {
             let nr_q = ss.nr_queued_task;
             let nr_active_cpdoms = ss.nr_active_cpdoms;
             let nr_stealee = ss.nr_stealee;
-            let nr_idle = ss.nr_idle_select;
-            let nr_nonidle = ss.nr_nonidle_select;
-            let total = nr_idle + nr_nonidle;
-            let idle_pct = if total > 0 { (nr_idle * 100) / total } else { 0 };
-            let nr_local = ss.nr_enqueue_local;
-            let nr_cpdom = ss.nr_enqueue_cpdom;
-            let nr_global = ss.nr_enqueue_global;
-            let enqueue_total = nr_local + nr_cpdom + nr_global;
 
-            println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2} | select: idle={:6} nonidle={:6} ({:3}% idle) | enqueue: local={:6} cpdom={:6} global={:6}",
-                     tick, util, nr_active, nr_q, nr_active_cpdoms, nr_stealee,
-                     nr_idle, nr_nonidle, idle_pct,
-                     nr_local, nr_cpdom, nr_global);
+#[cfg(feature = "stats")]
+            {
+                let nr_idle = ss.nr_idle_select;
+                let nr_nonidle = ss.nr_nonidle_select;
+                let total = nr_idle + nr_nonidle;
+                let idle_pct = if total > 0 { (nr_idle * 100) / total } else { 0 };
+                let nr_local = ss.nr_enqueue_local;
+                let nr_cpdom = ss.nr_enqueue_cpdom;
+                let nr_global = ss.nr_enqueue_global;
+
+                println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2} | select: idle={:6} nonidle={:6} ({:3}% idle) | enqueue: local={:6} cpdom={:6} global={:6}",
+                         tick, util, nr_active, nr_q, nr_active_cpdoms, nr_stealee,
+                         nr_idle, nr_nonidle, idle_pct,
+                         nr_local, nr_cpdom, nr_global);
+            }
+
+#[cfg(not(feature = "stats"))]
+            println!("[{:5}] util={:3}% active={:3} queued={:3} cpdoms={:2} stealee={:2}",
+                     tick, util, nr_active, nr_q, nr_active_cpdoms, nr_stealee);
         }
 
         self.struct_ops.take();
