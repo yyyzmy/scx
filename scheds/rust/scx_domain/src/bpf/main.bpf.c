@@ -1,4 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * A soft_domain scheduler.
+ *
+ * - By adopting a domain-based isolation scheduling approach, tasks within containers are
+ * - aggregated and scheduled to run on a set of CPUs that meet the container's CPU requirements
+ * - during periods when the container's CPU resource utilization is low.
+ * - This prevents tasks across different containers from competing for the same cluster's or numa's
+ * - cache and memory bandwidth, thereby reducing mutual interference between containers.
+ *
+ */
 #ifdef LSP
 #ifndef __bpf__
 #define __bpf__
@@ -9,58 +19,57 @@
 #endif
 
 #include "intf.h"
-
 char _license[] SEC("license") = "GPL";
 
 const volatile u32 max_cpus = MAX_CPUS;
 const volatile s32 allowed_node = -1;
 const volatile char target_comm[TASK_COMM_LEN] = "";
 static const __u16 pelt_subperiod_q10[9] = {
-	1024,
-	1021,
-	1018,
-	1016,
-	1013,
-	1010,
-	1007,
-	1005,
-	1002
+	1024, /*   0us */
+	1021, /* 128us */
+	1018, /* 256us */
+	1016, /* 384us */
+	1013, /* 512us */
+	1010, /* 640us */
+	1007, /* 768us */
+	1005, /* 896us */
+	1002  /* 1024us ~= 1 period */
 };
 
 static const __u16 pelt_period_q10[33] = {
-	1024,
-	1002,
-	 981,
-	 960,
-	 939,
-	 919,
-	 899,
-	 880,
-	 861,
-	 843,
-	 825,
-	 807,
-	 790,
-	 773,
-	 756,
-	 740,
-	 724,
-	 709,
-	 693,
-	 679,
-	 664,
-	 650,
-	 636,
-	 622,
-	 609,
-	 596,
-	 583,
-	 571,
-	 558,
-	 546,
-	 535,
-	 523,
-	 512
+	1024, /*  0 */
+	1002, /*  1 */
+	 981, /*  2 */
+	 960, /*  3 */
+	 939, /*  4 */
+	 919, /*  5 */
+	 899, /*  6 */
+	 880, /*  7 */
+	 861, /*  8 */
+	 843, /*  9 */
+	 825, /* 10 */
+	 807, /* 11 */
+	 790, /* 12 */
+	 773, /* 13 */
+	 756, /* 14 */
+	 740, /* 15 */
+	 724, /* 16 */
+	 709, /* 17 */
+	 693, /* 18 */
+	 679, /* 19 */
+	 664, /* 20 */
+	 650, /* 21 */
+	 636, /* 22 */
+	 622, /* 23 */
+	 609, /* 24 */
+	 596, /* 25 */
+	 583, /* 26 */
+	 571, /* 27 */
+	 558, /* 28 */
+	 546, /* 29 */
+	 535, /* 30 */
+	 523, /* 31 */
+	 512  /* 32 */
 };
 
 UEI_DEFINE(uei);
@@ -454,10 +463,6 @@ s32 BPF_STRUCT_OPS(domain_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	goto insert_prev_cpu;
 
 insert_cpu:
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-		cpu = prev_cpu;
-		return prev_cpu;
-	}
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
 	return cpu;
 
@@ -498,7 +503,7 @@ void BPF_STRUCT_OPS(domain_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-	if (can_fast_insert_local(p, *cpu_ptr) && bpf_cpumask_test_cpu(*cpu_ptr, p->cpus_ptr)) {
+	if (can_fast_insert_local(p, *cpu_ptr)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | *cpu_ptr, SCX_SLICE_DFL, 0);
 		return;
 	}
