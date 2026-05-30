@@ -501,12 +501,30 @@ void BPF_STRUCT_OPS(domain_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	u32 pid = p->pid;
 	s32 *cpu_ptr = bpf_map_lookup_elem(&cpus_selected, &pid);
-	if (!cpu_ptr) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	if (!cpu_ptr || !bpf_cpumask_test_cpu(*cpu_ptr, p->cpus_ptr)) {
+		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+			return;
+		}
+
+		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+		if (cpu >= 0) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			return;
+		}
+
+		cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
+		if (cpu >= 0) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			return;
+		}
+
 		return;
 	}
 
-	if (can_fast_insert_local(p, *cpu_ptr) && bpf_cpumask_test_cpu(*cpu_ptr, p->cpus_ptr)) {
+	if (can_fast_insert_local(p, *cpu_ptr)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | *cpu_ptr, SCX_SLICE_DFL, 0);
 		return;
 	}
