@@ -533,7 +533,7 @@ void BPF_STRUCT_OPS(domain_dispatch, s32 cpu, struct task_struct *p)
 	struct cpu_ctx *cpuc = lookup_cpu_ctx(cpu);
 	if (cpuc) {
 		u64 dsq_id = SCX_DSQ_ID_BASE + cpuc->llc_id;
-		scx_bpf_dsq_move_to_local(dsq_id);
+		scx_bpf_dsq_move_to_local(dsq_id, 0);
 		return;
 	}
 }
