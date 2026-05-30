@@ -463,6 +463,9 @@ s32 BPF_STRUCT_OPS(domain_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	goto insert_prev_cpu;
 
 insert_cpu:
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+		return prev_cpu;
+	}
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
 	return cpu;
 
@@ -503,7 +506,7 @@ void BPF_STRUCT_OPS(domain_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-	if (can_fast_insert_local(p, *cpu_ptr)) {
+	if (can_fast_insert_local(p, *cpu_ptr) && bpf_cpumask_test_cpu(*cpu_ptr, p->cpus_ptr)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | *cpu_ptr, SCX_SLICE_DFL, 0);
 		return;
 	}
