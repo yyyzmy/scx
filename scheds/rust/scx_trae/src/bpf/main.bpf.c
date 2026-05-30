@@ -658,7 +658,7 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 	struct sys_stat *ss = get_sys_stat();
 	struct cpu_ctx *cpuc;
 	struct cpdom_ctx *cpdomc;
-	u32 nr_active = 0, nr_active_cpdoms = 0, nr_stealee = 0;
+	u32 nr_active = 0, nr_active_cpdoms = 0, nr_stealee = 0, nr_queued = 0;
 	int cpu, i;
 
 	if (!ss)
@@ -689,6 +689,9 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 		if (cpdomc->nr_active_cpus > 0)
 			nr_active_cpdoms++;
 
+		cpdomc->nr_queued_task = scx_bpf_dsq_nr_queued(dom_to_dsq(i));
+		nr_queued += cpdomc->nr_queued_task;
+
 		cpdomc->is_stealer = false;
 		cpdomc->is_stealee = false;
 
@@ -706,6 +709,7 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 
 	ss->nr_active_cpdoms = nr_active_cpdoms;
 	ss->nr_stealee = nr_stealee;
+	ss->nr_queued_task = nr_queued;
 
 out:
 	bpf_timer_start(timer, 10000000ULL, 0);
