@@ -29,6 +29,7 @@ members = [
     "scheds/rust/scx_rusty",
     "scheds/rust/scx_tickless",
     "scheds/rust/scx_timely",
+    "scheds/rust/scx_trae",
     "scheds/rust/scx_wd40",
     "tools/scxcash",
     "tools/scxtop",
