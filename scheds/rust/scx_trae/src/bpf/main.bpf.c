@@ -407,9 +407,8 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *cd_cpumask, *a_cpumask, *i_cpumask;
-	const struct cpumask *idle_cpumask;
+	const struct cpumask *idle_cpumask, *idle_smtmask;
 	s32 cpu_id = -1;
-	u32 sib;
 
 	if (p->flags & PF_KTHREAD) {
 		cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
@@ -436,33 +435,36 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bpf_cpumask_and(i_cpumask, cast_mask(a_cpumask), idle_cpumask);
 
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
-		if (is_smt_active &&
-		    bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
-			sib = cpu_sibling[prev_cpu];
-			if (sib < TRAE_CPU_ID_MAX &&
-			    sib != (u32)prev_cpu &&
-			    bpf_cpumask_test_cpu(sib, idle_cpumask)) {
+		if (is_smt_active) {
+			idle_smtmask = scx_bpf_get_idle_smtmask();
+
+			if (bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
+			    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
 				cpu_id = prev_cpu;
-			} else if (sib < TRAE_CPU_ID_MAX &&
-				   sib != (u32)prev_cpu &&
-				   !bpf_cpumask_test_cpu(sib, idle_cpumask)) {
-				cpu_id = scx_bpf_pick_idle_cpu(cast_mask(i_cpumask), SCX_PICK_IDLE_CORE);
-				if (cpu_id < 0)
-					cpu_id = prev_cpu;
-			} else {
-				cpu_id = prev_cpu;
+				scx_bpf_put_idle_cpumask(idle_smtmask);
+				goto out_found;
 			}
-		} else if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
-			cpu_id = prev_cpu;
+
+			cpu_id = scx_bpf_pick_idle_cpu(cast_mask(i_cpumask),
+						       SCX_PICK_IDLE_CORE);
+			scx_bpf_put_idle_cpumask(idle_smtmask);
+			if (cpu_id >= 0)
+				goto out_found;
+
+			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
+				cpu_id = prev_cpu;
+				goto out_found;
+			}
 		} else {
-			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
+			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
+				cpu_id = prev_cpu;
+				goto out_found;
+			}
 		}
-		if (cpu_id >= 0) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
-			scx_bpf_put_idle_cpumask(idle_cpumask);
-			bpf_rcu_read_unlock();
-			return cpu_id;
-		}
+
+		cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
+		if (cpu_id >= 0)
+			goto out_found;
 	}
 
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
@@ -477,6 +479,12 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
 	return cpu_id >= 0 ? cpu_id : prev_cpu;
+
+out_found:
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
+	scx_bpf_put_idle_cpumask(idle_cpumask);
+	bpf_rcu_read_unlock();
+	return cpu_id;
 }
 
 void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
