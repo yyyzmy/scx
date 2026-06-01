@@ -412,12 +412,15 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (p->flags & PF_KTHREAD) {
 		cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
+		bpf_printk("select_cpu: kthread cpu=%d", cpu_id >= 0 ? cpu_id : prev_cpu);
 		return cpu_id >= 0 ? cpu_id : prev_cpu;
 	}
 
 	cpuc = get_cpu_ctx_id(prev_cpu);
-	if (!cpuc)
+	if (!cpuc) {
+		bpf_printk("select_cpu: no cpuc prev=%d", prev_cpu);
 		return prev_cpu;
+	}
 
 	bpf_rcu_read_lock();
 
@@ -426,6 +429,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	i_cpumask = cpuc->tmp_i_mask;
 	if (!cd_cpumask || !a_cpumask || !i_cpumask) {
 		bpf_rcu_read_unlock();
+		bpf_printk("select_cpu: no masks prev=%d", prev_cpu);
 		return prev_cpu;
 	}
 
@@ -435,10 +439,13 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bpf_cpumask_and(i_cpumask, cast_mask(a_cpumask), idle_cpumask);
 
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
-		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask)))
+		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
 			cpu_id = prev_cpu;
-		else
+			bpf_printk("select_cpu: idle_prev cpu=%d", cpu_id);
+		} else {
 			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
+			bpf_printk("select_cpu: idle_other cpu=%d", cpu_id);
+		}
 
 		if (cpu_id >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
@@ -450,6 +457,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
 		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask), 0);
+		bpf_printk("select_cpu: cpdom_nonidle cpu=%d", cpu_id);
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -459,6 +467,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return cpu_id;
 
 	cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
+	bpf_printk("select_cpu: fallback cpu=%d", cpu_id >= 0 ? cpu_id : prev_cpu);
 	return cpu_id >= 0 ? cpu_id : prev_cpu;
 }
 
