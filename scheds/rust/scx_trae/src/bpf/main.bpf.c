@@ -313,17 +313,7 @@ static int init_per_cpu_ctx(void)
 		}
 	}
 
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (cpu >= TRAE_CPU_ID_MAX)
-			break;
-		cpuc = get_cpu_ctx_id(cpu);
-		if (!cpuc)
-			continue;
-		bpf_printk("trae: cpu[%d] cpdom=%u alt=%u numa=%u llc=%u big=%d cap=%u",
-			   cpu, cpuc->cpdom_id, cpuc->cpdom_alt_id,
-			   cpuc->numa_id, cpuc->llc_id, cpuc->big_core,
-			   cpuc->max_capacity);
-	}
+	
 
 unlock_out:
 	scx_bpf_put_cpumask(online_cpumask);
@@ -412,13 +402,11 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (p->flags & PF_KTHREAD) {
 		cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
-		bpf_printk("select_cpu: kthread cpu=%d", cpu_id >= 0 ? cpu_id : prev_cpu);
 		return cpu_id >= 0 ? cpu_id : prev_cpu;
 	}
 
 	cpuc = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc) {
-		bpf_printk("select_cpu: no cpuc prev=%d", prev_cpu);
 		return prev_cpu;
 	}
 
@@ -429,7 +417,6 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	i_cpumask = cpuc->tmp_i_mask;
 	if (!cd_cpumask || !a_cpumask || !i_cpumask) {
 		bpf_rcu_read_unlock();
-		bpf_printk("select_cpu: no masks prev=%d", prev_cpu);
 		return prev_cpu;
 	}
 
@@ -441,10 +428,8 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
 		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
 			cpu_id = prev_cpu;
-			bpf_printk("select_cpu: idle_prev cpu=%d", cpu_id);
 		} else {
 			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
-			bpf_printk("select_cpu: idle_other cpu=%d", cpu_id);
 		}
 
 		if (cpu_id >= 0) {
@@ -457,7 +442,6 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (!bpf_cpumask_empty(cast_mask(a_cpumask))) {
 		cpu_id = scx_bpf_pick_any_cpu(cast_mask(a_cpumask), 0);
-		bpf_printk("select_cpu: cpdom_nonidle cpu=%d", cpu_id);
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -467,13 +451,13 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return cpu_id;
 
 	cpu_id = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
-	bpf_printk("select_cpu: fallback cpu=%d", cpu_id >= 0 ? cpu_id : prev_cpu);
 	return cpu_id >= 0 ? cpu_id : prev_cpu;
 }
 
 void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc;
+	struct bpf_cpumask *cd_cpumask;
 	u32 cpdom_id;
 	u64 dsq_id;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
@@ -503,7 +487,26 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
+	bpf_rcu_read_lock();
+
 	cpdom_id = cpuc->cpdom_id;
+	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
+
+	if (!cd_cpumask || !bpf_cpumask_intersects(cast_mask(cd_cpumask), p->cpus_ptr)) {
+		bpf_rcu_read_unlock();
+		scx_bpf_dsq_insert(p, TRAE_GLOBAL_DSQ, slice_max_ns, enq_flags);
+#ifdef TRAE_STATS
+		{
+			struct sys_stat *ss = get_sys_stat();
+			if (ss)
+				__sync_fetch_and_add(&ss->nr_enqueue_global, 1);
+		}
+#endif
+		return;
+	}
+
+	bpf_rcu_read_unlock();
+
 	dsq_id = dom_to_dsq(cpdom_id);
 	scx_bpf_dsq_insert(p, dsq_id, slice_max_ns, enq_flags);
 #ifdef TRAE_STATS
@@ -744,9 +747,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(trae_init)
 	err = init_sys_stat();
 	if (err)
 		return err;
-
-	bpf_printk("trae: topology initialized - %d cpdoms, %d cpus, %d numas, smt=%d",
-		   nr_cpdoms, nr_cpus_onln, nr_numas, is_smt_active);
 
 	return 0;
 }
