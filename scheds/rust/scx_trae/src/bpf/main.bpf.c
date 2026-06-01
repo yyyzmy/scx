@@ -397,7 +397,7 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *cd_cpumask, *a_cpumask, *i_cpumask;
-	const struct cpumask *idle_cpumask;
+	const struct cpumask *idle_cpumask, *idle_smtmask;
 	s32 cpu_id = -1;
 
 	if (p->flags & PF_KTHREAD) {
@@ -426,9 +426,26 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bpf_cpumask_and(i_cpumask, cast_mask(a_cpumask), idle_cpumask);
 
 	if (!bpf_cpumask_empty(cast_mask(i_cpumask))) {
-		if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
-			cpu_id = prev_cpu;
+		if (is_smt_active) {
+			idle_smtmask = scx_bpf_get_idle_smtmask();
+
+			if (bpf_cpumask_test_cpu(prev_cpu, idle_smtmask)) {
+				cpu_id = prev_cpu;
+			}
+
+			if (cpu_id < 0) {
+				cpu_id = scx_bpf_pick_idle_cpu(cast_mask(i_cpumask),
+							       SCX_PICK_IDLE_CORE);
+			}
+
+			scx_bpf_put_idle_cpumask(idle_smtmask);
 		} else {
+			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(i_cpumask))) {
+				cpu_id = prev_cpu;
+			}
+		}
+
+		if (cpu_id < 0) {
 			cpu_id = scx_bpf_pick_any_cpu(cast_mask(i_cpumask), 0);
 		}
 
