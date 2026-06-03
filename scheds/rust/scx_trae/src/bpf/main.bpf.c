@@ -401,10 +401,14 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 	s32 cpu_id = -1;
 
 	if (p->flags & PF_KTHREAD) {
+		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_min_ns, 0);
+			return prev_cpu;
+		}
 		cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 		if (cpu_id >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu_id,
-					   slice_max_ns, 0);
+					   slice_min_ns, 0);
 			return cpu_id;
 		}
 		return prev_cpu;
@@ -476,8 +480,7 @@ void BPF_STRUCT_OPS(trae_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 
 	if (p->flags & PF_KTHREAD) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns,
-				   enq_flags | SCX_ENQ_PREEMPT);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_min_ns, enq_flags);
 #ifdef TRAE_STATS
 		{
 			struct sys_stat *ss = get_sys_stat();
@@ -554,7 +557,7 @@ void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	cpdomc = get_cpdom_ctx(cpuc->cpdom_id);
-	if (!cpdomc)
+	if (!cpdomc || !cpdomc->is_stealee)
 		return;
 
 	for (d = 0; d < TRAE_CPDOM_MAX_DIST; d++) {
@@ -571,7 +574,7 @@ void BPF_STRUCT_OPS(trae_dispatch, s32 cpu, struct task_struct *prev)
 				continue;
 
 			ncpdomc = get_cpdom_ctx((u32)nid);
-			if (!ncpdomc || !ncpdomc->is_valid)
+			if (!ncpdomc || !ncpdomc->is_valid || !ncpdomc->is_stealer)
 				continue;
 
 			dsq_id = dom_to_dsq((u32)nid);
