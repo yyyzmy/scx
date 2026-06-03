@@ -414,6 +414,23 @@ s32 BPF_STRUCT_OPS(trae_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu;
 	}
 
+	/*
+	 * Sync wakeup: waker is about to yield the CPU, so placing
+	 * wakee on the waker's CPU avoids a context switch and
+	 * maximizes cache locality.
+	 */
+	if (wake_flags & SCX_WAKE_SYNC) {
+		s32 waker_cpu = bpf_get_smp_processor_id();
+
+		if (waker_cpu != prev_cpu &&
+		    bpf_cpumask_test_cpu(waker_cpu, p->cpus_ptr) &&
+		    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | waker_cpu)) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | waker_cpu,
+					   slice_max_ns, 0);
+			return waker_cpu;
+		}
+	}
+
 	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max_ns, 0);
 		return prev_cpu;
