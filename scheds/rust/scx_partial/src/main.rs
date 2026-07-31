@@ -73,12 +73,9 @@ impl<'a> Scheduler<'a> {
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.partial_pid_threshold = opts.pid_threshold;
 
-        // Load the BPF program
-        let mut skel = scx_ops_load!(skel, partial_ops, uei)?;
-
-        // Configure scheduler flags
+        // Configure scheduler flags BEFORE loading
         // Enable SCX_OPS_SWITCH_PARTIAL to allow partial takeover mode
-        skel.struct_ops().partial_ops_mut().flags = *compat::SCX_OPS_SWITCH_PARTIAL
+        skel.struct_ops.partial_ops_mut().flags = *compat::SCX_OPS_SWITCH_PARTIAL
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
 
         info!(
@@ -86,6 +83,9 @@ impl<'a> Scheduler<'a> {
             opts.pid_threshold
         );
         info!("Tasks with PID >= {} will be restricted to CPU 0-7", opts.pid_threshold);
+
+        // Load the BPF program
+        let mut skel = scx_ops_load!(skel, partial_ops, uei)?;
 
         // Attach the scheduler
         let struct_ops = Some(scx_ops_attach!(skel, partial_ops)?);
