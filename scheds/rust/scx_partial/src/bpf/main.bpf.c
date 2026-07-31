@@ -12,29 +12,9 @@
 
 char _license[] SEC("license") = "GPL";
 
-/* PID threshold: only tasks with PID >= this value will be taken over */
-const volatile u32 partial_pid_threshold = 1000;
-
 /* CPU range for restricted tasks: 0-7 */
 #define PARTIAL_CPU_MIN 0
 #define PARTIAL_CPU_MAX 7
-
-/*
- * Check if a task should be taken over by this scheduler.
- * Returns true if the task should be taken over.
- */
-static __always_inline bool should_take_over_task(struct task_struct *p)
-{
-    /* Skip kernel threads */
-    if (p->flags & PF_KTHREAD)
-        return false;
-
-    /* Skip tasks with PID below threshold */
-    if (p->pid < partial_pid_threshold)
-        return false;
-
-    return true;
-}
 
 /*
  * Check if a CPU is within the allowed range (0-7).
@@ -112,16 +92,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(partial_init_task, struct task_struct *p,
                              struct scx_init_task_args *args)
 {
     struct task_ctx *tctx;
-
-    /*
-     * Decision point: decide whether to take over this task.
-     * Return -ESRCH to refuse takeover (task will remain with built-in scheduler).
-     * Return 0 to accept takeover.
-     */
-    if (!should_take_over_task(p)) {
-        /* Refuse to take over this task */
-        return -ESRCH;
-    }
 
     /* Allocate and initialize task context */
     tctx = get_or_create_task_ctx(p);

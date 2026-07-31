@@ -33,10 +33,6 @@ struct Opts {
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
-    /// PID threshold: only tasks with PID >= this value will be taken over.
-    #[clap(long, default_value_t = 1000)]
-    pid_threshold: u32,
-
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -69,20 +65,15 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, partial_ops, open_opts)?;
 
-        // Set the PID threshold from command line
-        let rodata = skel.maps.rodata_data.as_mut().unwrap();
-        rodata.partial_pid_threshold = opts.pid_threshold;
-
         // Configure scheduler flags BEFORE loading
-        // Enable SCX_OPS_SWITCH_PARTIAL to allow partial takeover mode
+        // Enable SCX_OPS_SWITCH_PARTIAL to enable partial takeover mode
+        // With this flag, only tasks with SCHED_EXT policy are taken over
         skel.struct_ops.partial_ops_mut().flags = *compat::SCX_OPS_SWITCH_PARTIAL
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
 
-        info!(
-            "Partial scheduler initialized with PID threshold: {}",
-            opts.pid_threshold
-        );
-        info!("Tasks with PID >= {} will be restricted to CPU 0-7", opts.pid_threshold);
+        info!("Partial scheduler initialized");
+        info!("Only tasks with SCHED_EXT policy will be taken over and restricted to CPU 0-7");
+        info!("Use `chrt -E <pid>` to move a task to SCHED_EXT policy");
 
         // Load the BPF program
         let mut skel = scx_ops_load!(skel, partial_ops, uei)?;
