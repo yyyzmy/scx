@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
 
-use std::path::PathBuf;
-
 fn main() {
-    scx_cargo::build(PathBuf::from("./src/bpf"));
+    scx_cargo::BpfBuilder::new()
+        .unwrap()
+        .enable_skel("src/bpf/main.bpf.c", "bpf")
+        .build()
+        .unwrap();
 }
