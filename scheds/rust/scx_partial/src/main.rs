@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::OpenObject;
+use libbpf_rs::{MapCore, OpenObject};
 use log::{debug, info};
 use scx_utils::compat;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
@@ -103,21 +103,26 @@ impl<'a> Scheduler<'a> {
             tick += 1;
 
             // Read stats from BPF map (reference scx_trae's implementation)
-            let stats: &PartialStats = match self.skel.maps.partial_stats_stor.lookup(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY) {
-                Ok(Some(s)) => unsafe { &*(s.as_ptr() as *const _ as *const PartialStats) },
-                _ => {
-                    info!("[{:5}] Managed tasks: N/A (stats lookup failed)");
-                    continue;
+            let stats_data = self.skel.maps.partial_stats_stor.lookup(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY);
+            match stats_data {
+                Ok(Some(data)) => {
+                    if data.len() >= std::mem::size_of::<PartialStats>() {
+                        let stats: &PartialStats = unsafe { &*(data.as_ptr() as *const PartialStats) };
+                        info!(
+                            "[{:5}] Managed tasks: {}, Initialized: {}, Exited: {}",
+                            tick,
+                            stats.nr_managed,
+                            stats.nr_init,
+                            stats.nr_exit
+                        );
+                    } else {
+                        info!("[{:5}] Managed tasks: N/A (stats data too short)", tick);
+                    }
                 }
-            };
-
-            info!(
-                "[{:5}] Managed tasks: {}, Initialized: {}, Exited: {}",
-                tick,
-                stats.nr_managed,
-                stats.nr_init,
-                stats.nr_exit
-            );
+                _ => {
+                    info!("[{:5}] Managed tasks: N/A (stats lookup failed)", tick);
+                }
+            }
         }
 
         let _ = self.struct_ops.take();
