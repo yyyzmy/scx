@@ -29,21 +29,11 @@ static __always_inline bool cpu_in_range(s32 cpu)
  */
 static __always_inline s32 pick_idle_cpu_in_range(struct task_struct *p, s32 prev_cpu)
 {
-    s32 c;
-
     /* First try previous CPU if it's in range and usable */
     if (prev_cpu >= 0 && cpu_in_range(prev_cpu) &&
         bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
         scx_bpf_test_and_clear_cpu_idle(prev_cpu))
         return prev_cpu;
-
-    /* Otherwise scan CPUs 0-7 for an idle one */
-    bpf_for(c, PARTIAL_CPU_MIN, PARTIAL_CPU_MAX + 1) {
-        if (!bpf_cpumask_test_cpu(c, p->cpus_ptr))
-            continue;
-        if (scx_bpf_test_and_clear_cpu_idle(c))
-            return c;
-    }
 
     return -1;
 }
@@ -53,18 +43,10 @@ static __always_inline s32 pick_idle_cpu_in_range(struct task_struct *p, s32 pre
  */
 static __always_inline s32 pick_cpu_in_range(struct task_struct *p, s32 prev_cpu)
 {
-    s32 c;
-
     /* First try previous CPU if it's in range and usable */
     if (prev_cpu >= 0 && cpu_in_range(prev_cpu) &&
         bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
         return prev_cpu;
-
-    /* Otherwise pick the first usable CPU in range */
-    bpf_for(c, PARTIAL_CPU_MIN, PARTIAL_CPU_MAX + 1) {
-        if (bpf_cpumask_test_cpu(c, p->cpus_ptr))
-            return c;
-    }
 
     return -1;
 }
@@ -108,27 +90,23 @@ s32 BPF_STRUCT_OPS(partial_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 {
     s32 cpu;
 
-    /* Ensure prev_cpu is valid */
-    if (prev_cpu < 0 || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
-        prev_cpu = bpf_cpumask_first(p->cpus_ptr);
-
-    /* Try to find an idle CPU within the restricted range */
-    cpu = pick_idle_cpu_in_range(p, prev_cpu);
-    if (cpu >= 0)
+    /* Ensure prev_cpu is valid and within range */
+    if (prev_cpu < 0 || !cpu_in_range(prev_cpu) || !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+        /* Start from first available CPU */
+        cpu = bpf_cpumask_first(p->cpus_ptr);
+        if (cpu >= 0 && !cpu_in_range(cpu)) {
+            /* If first CPU is outside range, use PARTIAL_CPU_MIN if available */
+            if (bpf_cpumask_test_cpu(PARTIAL_CPU_MIN, p->cpus_ptr))
+                cpu = PARTIAL_CPU_MIN;
+        }
         return cpu;
+    }
 
-    /* Fall back to any CPU in range */
-    cpu = pick_cpu_in_range(p, prev_cpu);
-    if (cpu >= 0)
-        return cpu;
+    /* prev_cpu is valid and in range, try to reuse it if idle */
+    if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+        return prev_cpu;
 
-    /* Last resort: use default selection but clamp to range */
-    cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, NULL);
-    if (cpu_in_range(cpu))
-        return cpu;
-
-    /* Return first CPU in range as final fallback */
-    return PARTIAL_CPU_MIN;
+    return prev_cpu;
 }
 
 void BPF_STRUCT_OPS(partial_running, struct task_struct *p)
@@ -176,9 +154,12 @@ void BPF_STRUCT_OPS(partial_enqueue, struct task_struct *p, u64 enq_flags)
 
     /* If CPU not selected, try to find one and kick it */
     if (!cpu_selected) {
-        cpu = pick_idle_cpu_in_range(p, scx_bpf_task_cpu(p));
-        if (cpu >= 0)
+        cpu = scx_bpf_task_cpu(p);
+        if (cpu >= 0 && cpu_in_range(cpu) &&
+            bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
+            scx_bpf_test_and_clear_cpu_idle(cpu)) {
             scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+        }
     }
 }
 
