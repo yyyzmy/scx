@@ -63,6 +63,28 @@ struct {
     __type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
+/* Statistics structure for managed tasks */
+struct partial_stats {
+    u32 nr_managed;        /* Number of managed tasks */
+    u32 nr_init;           /* Number of task initializations */
+    u32 nr_exit;           /* Number of task exits */
+};
+
+/* Storage for statistics (single entry array) */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct partial_stats);
+} partial_stats_stor SEC(".maps");
+
+/* Helper to get statistics pointer */
+static __always_inline struct partial_stats *get_partial_stats(void)
+{
+    u32 key = 0;
+    return bpf_map_lookup_elem(&partial_stats_stor, &key);
+}
+
 UEI_DEFINE(uei);
 
 static __always_inline struct task_ctx *get_or_create_task_ctx(struct task_struct *p)
@@ -74,6 +96,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(partial_init_task, struct task_struct *p,
                              struct scx_init_task_args *args)
 {
     struct task_ctx *tctx;
+    struct partial_stats *stats;
 
     /* Allocate and initialize task context */
     tctx = get_or_create_task_ctx(p);
@@ -82,6 +105,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(partial_init_task, struct task_struct *p,
 
     tctx->avg_runtime = SCX_SLICE_DFL;
     tctx->last_run_at = 0;
+
+    /* Update statistics */
+    stats = get_partial_stats();
+    if (stats) {
+        __sync_fetch_and_add(&stats->nr_managed, 1);
+        __sync_fetch_and_add(&stats->nr_init, 1);
+    }
 
     return 0;
 }
@@ -142,6 +172,15 @@ void BPF_STRUCT_OPS(partial_enable, struct task_struct *p)
     /* Task is entering sched_ext control */
 }
 
+void BPF_STRUCT_OPS(partial_disable, struct task_struct *p)
+{
+    struct partial_stats *stats = get_partial_stats();
+    if (stats) {
+        __sync_fetch_and_sub(&stats->nr_managed, 1);
+        __sync_fetch_and_add(&stats->nr_exit, 1);
+    }
+}
+
 void BPF_STRUCT_OPS(partial_enqueue, struct task_struct *p, u64 enq_flags)
 {
     bool cpu_selected;
@@ -196,6 +235,7 @@ SCX_OPS_DEFINE(partial_ops,
                .running        = (void *)partial_running,
                .stopping       = (void *)partial_stopping,
                .enable         = (void *)partial_enable,
+               .disable        = (void *)partial_disable,
                .init_task      = (void *)partial_init_task,
                .init           = (void *)partial_init,
                .exit           = (void *)partial_exit,

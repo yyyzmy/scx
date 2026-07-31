@@ -41,6 +41,13 @@ struct Opts {
     pub libbpf: LibbpfOpts,
 }
 
+#[repr(C)]
+struct PartialStats {
+    nr_managed: u32,
+    nr_init: u32,
+    nr_exit: u32,
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -89,8 +96,28 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
+        let mut tick = 0u64;
+
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            tick += 1;
+
+            // Read stats from BPF map (reference scx_trae's implementation)
+            let stats: &PartialStats = match self.skel.maps.partial_stats_stor.lookup(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY) {
+                Ok(Some(s)) => unsafe { &*(s.as_ptr() as *const _ as *const PartialStats) },
+                _ => {
+                    info!("[{:5}] Managed tasks: N/A (stats lookup failed)");
+                    continue;
+                }
+            };
+
+            info!(
+                "[{:5}] Managed tasks: {}, Initialized: {}, Exited: {}",
+                tick,
+                stats.nr_managed,
+                stats.nr_init,
+                stats.nr_exit
+            );
         }
 
         let _ = self.struct_ops.take();
