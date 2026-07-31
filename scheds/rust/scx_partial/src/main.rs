@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use libbpf_rs::OpenObject;
 use log::{debug, info};
+use scx_utils::compat;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -77,7 +78,7 @@ impl<'a> Scheduler<'a> {
 
         // Configure scheduler flags
         // Enable SCX_OPS_SWITCH_PARTIAL to allow partial takeover mode
-        skel.struct_ops.partial_ops_mut().flags = *compat::SCX_OPS_SWITCH_PARTIAL
+        skel.struct_ops().partial_ops_mut().flags = *compat::SCX_OPS_SWITCH_PARTIAL
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
 
         info!(
