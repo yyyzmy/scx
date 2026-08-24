@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // scx_partial: Partial scheduler that only takes over specific tasks
-//              and restricts them to run on CPU 0-7.
+//              and restricts them to run on CPU 80-87.
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -79,7 +79,7 @@ impl<'a> Scheduler<'a> {
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
 
         info!("Partial scheduler initialized");
-        info!("Only tasks with SCHED_EXT policy will be taken over and restricted to CPU 0-7");
+        info!("Only tasks with SCHED_EXT policy will be taken over and restricted to CPU 80-87");
         info!("Use `chrt -E <pid>` to move a task to SCHED_EXT policy");
 
         // Load the BPF program

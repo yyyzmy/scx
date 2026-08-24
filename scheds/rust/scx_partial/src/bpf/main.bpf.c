@@ -1,23 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * scx_partial: Partial scheduler that only takes over specific tasks
- *              and restricts them to run on CPU 0-7.
+ *              and restricts them to run on CPU 80-87.
  *
  * Features:
  * 1. Partial takeover mode: Only tasks with PID >= PARTIAL_PID_THRESHOLD are taken over
- * 2. CPU restriction: Taken over tasks can only run on CPU 0-7
+ * 2. CPU restriction: Taken over tasks can only run on CPU 80-87
  * 3. Simple FIFO scheduling within the restricted CPU set
  */
 #include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
-/* CPU range for restricted tasks: 0-7 */
-#define PARTIAL_CPU_MIN 0
-#define PARTIAL_CPU_MAX 7
+/* CPU range for restricted tasks: 80-87 */
+#define PARTIAL_CPU_MIN 80
+#define PARTIAL_CPU_MAX 87
 
 /*
- * Check if a CPU is within the allowed range (0-7).
+ * Check if a CPU is within the allowed range (80-87).
  */
 static __always_inline bool cpu_in_range(s32 cpu)
 {
@@ -25,7 +25,7 @@ static __always_inline bool cpu_in_range(s32 cpu)
 }
 
 /*
- * Try to find an idle CPU within the restricted range (0-7).
+ * Try to find an idle CPU within the restricted range (80-87).
  */
 static __always_inline s32 pick_idle_cpu_in_range(struct task_struct *p, s32 prev_cpu)
 {
@@ -39,7 +39,7 @@ static __always_inline s32 pick_idle_cpu_in_range(struct task_struct *p, s32 pre
 }
 
 /*
- * Try to find any available CPU within the restricted range (0-7).
+ * Try to find any available CPU within the restricted range (80-87).
  */
 static __always_inline s32 pick_cpu_in_range(struct task_struct *p, s32 prev_cpu)
 {
@@ -206,7 +206,7 @@ void BPF_STRUCT_OPS(partial_dispatch, s32 cpu, struct task_struct *prev)
 {
     /*
      * Only dispatch if this CPU is in our restricted range.
-     * This prevents tasks from running on CPUs outside 0-7.
+     * This prevents tasks from running on CPUs outside 80-87.
      */
     if (!cpu_in_range(cpu)) {
         /* Don't dispatch on CPUs outside our range */
