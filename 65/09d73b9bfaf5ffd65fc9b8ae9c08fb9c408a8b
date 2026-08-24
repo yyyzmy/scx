@@ -1,0 +1,34 @@
+scheds/rust/scx_kp/src/main.rs
+  s_561abb03a22fe1::t_44d4e8d5b5387a 133-137
+  s_561abb03a22fe1::t_9b343614d6f280 169-176
+  s_561abb03a22fe1::t_b69c9ff7050768 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "6509d73b9bfaf5ffd65fc9b8ae9c08fb9c408a8b",
+  "prompts": {},
+  "sessions": {
+    "s_561abb03a22fe1": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a0e64f8e574bbc9f2fb37ab",
+        "model": "glm-5.2"
+      },
+      "human_author": "ye yiyang <850219375@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "tool_use_id": "6a8c03cd377f955a837c2da2",
+        "operation_id": "6a8c03cd377f955a837c2da2",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "session_id": "6a0e64f8e574bbc9f2fb37ab",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "agent",
+        "dedupe_key": "6a0e64f8e574bbc9f2fb37ab:6a8c03cd377f955a837c2da2:afterEdit:08cd98d7",
+        "tool_type": "builtin",
+        "external_session_id": "6a0e64f8e574bbc9f2fb37ab"
+      }
+    }
+  }
+}
