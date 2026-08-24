@@ -13,6 +13,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use libbpf_rs::OpenObject;
 use log::{debug, info};
+use scx_utils::compat;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -129,6 +130,11 @@ struct Opts {
     #[clap(long, default_value_t = 100)]
     simple_wake_interval_thr_us: u64,
 
+    /// Partial takeover mode: only manage tasks explicitly set to SCHED_EXT.
+    /// Use `chrt -E <pid>` to move a task to SCHED_EXT policy.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    partial: bool,
+
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -160,6 +166,14 @@ impl<'a> Scheduler<'a> {
         skel_builder.obj_builder.debug(opts.verbose);
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, kp_ops, open_opts)?;
+
+        if opts.partial {
+            skel.struct_ops.kp_ops_mut().flags = *compat::SCX_OPS_SWITCH_PARTIAL
+                | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+            info!("Partial takeover mode: only tasks with SCHED_EXT policy are managed");
+            info!("Use `chrt -E <pid>` to move a task to SCHED_EXT policy");
+        }
+
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.kp_short_task_ns = opts.short_task_us * 1000;
         rodata.kp_aging_div = opts.aging_div.max(1);
