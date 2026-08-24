@@ -1,0 +1,38 @@
+scheds/rust/scx_partial/src/main.rs
+  s_561abb03a22fe1::t_4fee363c9074da 82
+  s_561abb03a22fe1::t_58fc64a32644a8 4
+scheds/rust/scx_partial/src/bpf/main.bpf.c
+  s_561abb03a22fe1::t_2c103132e7f2b7 28
+  s_561abb03a22fe1::t_3dfb9be3b18435 4,8,15-17,20
+  s_561abb03a22fe1::t_5f39bee88df2e8 42
+  s_561abb03a22fe1::t_0eb25eaa6f3235 209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "af3c2cfb752030afdd73d2ad7d051754f314669c",
+  "prompts": {},
+  "sessions": {
+    "s_561abb03a22fe1": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a0e64f8e574bbc9f2fb37ab",
+        "model": "glm-5.3"
+      },
+      "human_author": "ye yiyang <850219375@qq.com>",
+      "custom_attributes": {
+        "session_id": "6a0e64f8e574bbc9f2fb37ab",
+        "client_type": "ide",
+        "dedupe_key": "6a0e64f8e574bbc9f2fb37ab:6a8c105c377f955a837c2e0a:afterEdit:b08abee1",
+        "tool_type": "builtin",
+        "external_session_id": "6a0e64f8e574bbc9f2fb37ab",
+        "operation_id": "6a8c105c377f955a837c2e0a",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_use_id": "6a8c105c377f955a837c2e0a",
+        "edit_kind": "file_edit",
+        "source_scene": "agent"
+      }
+    }
+  }
+}
