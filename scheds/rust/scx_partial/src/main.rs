@@ -33,6 +33,12 @@ struct Opts {
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
+    /// Time slice in milliseconds for managed tasks (default 100ms).
+    /// Longer slices minimize context switches from slice expiry.
+    /// Set to 0 to use the kernel default (SCX_SLICE_DFL).
+    #[clap(long, default_value_t = 100)]
+    slice_ms: u64,
+
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -82,6 +88,23 @@ impl<'a> Scheduler<'a> {
         info!("Only tasks with SCHED_EXT policy will be taken over and restricted to CPU 80-87");
         info!("Use `chrt -E <pid>` to move a task to SCHED_EXT policy");
 
+        // Configure time slice
+        let rodata = skel.maps.rodata_data.as_mut().unwrap();
+        rodata.partial_slice_ns = if opts.slice_ms > 0 {
+            opts.slice_ms * 1000 * 1000
+        } else {
+            0 // 0 => BPF falls back to SCX_SLICE_DFL
+        };
+        info!(
+            "Time slice: {} ({} ms)",
+            if opts.slice_ms > 0 {
+                format!("{} ms", opts.slice_ms)
+            } else {
+                "kernel default".to_string()
+            },
+            opts.slice_ms
+        );
+
         // Load the BPF program
         let mut skel = scx_ops_load!(skel, partial_ops, uei)?;
 
@@ -97,32 +120,44 @@ impl<'a> Scheduler<'a> {
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let mut tick = 0u64;
+        let mut last = (0u64, 0u64, 0u64, 0u64);
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(std::time::Duration::from_secs(1));
             tick += 1;
 
-            // Read stats from BPF map (reference scx_trae's implementation)
             let stats_data = self.skel.maps.partial_stats_stor.lookup(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY);
-            match stats_data {
-                Ok(Some(data)) => {
-                    if data.len() >= std::mem::size_of::<PartialStats>() {
-                        let stats: &PartialStats = unsafe { &*(data.as_ptr() as *const PartialStats) };
-                        info!(
-                            "[{:5}] Managed tasks: {}, Initialized: {}, Exited: {}",
-                            tick,
-                            stats.nr_managed,
-                            stats.nr_init,
-                            stats.nr_exit
-                        );
-                    } else {
-                        info!("[{:5}] Managed tasks: N/A (stats data too short)", tick);
-                    }
+            let (nr_managed, _nr_init, _nr_exit) = match stats_data {
+                Ok(Some(data)) if data.len() >= std::mem::size_of::<PartialStats>() => {
+                    let stats: &PartialStats = unsafe { &*(data.as_ptr() as *const PartialStats) };
+                    (stats.nr_managed, stats.nr_init, stats.nr_exit)
                 }
-                _ => {
-                    info!("[{:5}] Managed tasks: N/A (stats lookup failed)", tick);
-                }
-            }
+                _ => (0, 0, 0),
+            };
+
+            let bss = self.skel.maps.bss_data.as_ref().unwrap();
+            let sleep = bss.nr_sleep_stop;
+            let slice_end = bss.nr_slice_end_stop;
+            let preempt = bss.nr_preempt_stop;
+            let disp = bss.nr_dispatches;
+            let total = sleep + slice_end + preempt;
+            let pct = |v: u64| if total > 0 { v * 100 / total } else { 0 };
+
+            println!(
+                "[{:5}] managed={} | stops total={} sleep={}({:3}%) preempt={}({:3}%) slice_end={}({:3}%) | d: sleep={} preempt={} slice_end={} | dispatches={} (+{})",
+                tick,
+                nr_managed,
+                total,
+                sleep, pct(sleep),
+                preempt, pct(preempt),
+                slice_end, pct(slice_end),
+                sleep - last.0,
+                preempt - last.2,
+                slice_end - last.1,
+                disp,
+                disp - last.3
+            );
+            last = (sleep, slice_end, preempt, disp);
         }
 
         let _ = self.struct_ops.take();

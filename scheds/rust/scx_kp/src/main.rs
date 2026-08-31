@@ -21,6 +21,7 @@ use scx_utils::scx_ops_open;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 
@@ -135,6 +136,22 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     partial: bool,
 
+    /// SMT-aware pairing: 1=on (default), 0=off. Auto-forced off on non-SMT machines.
+    #[clap(long, default_value_t = 1)]
+    smt_pair: u64,
+
+    /// SMT: max avg runtime (us) for a task to be classified latency-sensitive.
+    #[clap(long, default_value_t = 1000)]
+    smt_lat_runtime_us: u64,
+
+    /// SMT: min sleep-stop ratio (%) required for latency-sensitive class.
+    #[clap(long, default_value_t = 60)]
+    smt_lat_sleep_pct: u64,
+
+    /// SMT: min slice-expiry ratio (%) required for CPU-bound class.
+    #[clap(long, default_value_t = 30)]
+    smt_cpu_pct: u64,
+
     /// Print version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -198,6 +215,37 @@ impl<'a> Scheduler<'a> {
         for i in 0..5 {
             rodata.kp_simple_kthread_cpu_mask[i] = km[i];
         }
+
+        // SMT-aware pairing: fill the sibling table from topology.
+        let topo = Topology::new()?;
+        let siblings = topo.sibling_cpus();
+        let mut nr_smt_cpus = 0usize;
+        for (cpu, sib) in siblings.iter().enumerate() {
+            if cpu >= rodata.kp_cpu_sibling.len() {
+                break;
+            }
+            if *sib >= 0 {
+                rodata.kp_cpu_sibling[cpu] = *sib as u32;
+                nr_smt_cpus += 1;
+            } else {
+                rodata.kp_cpu_sibling[cpu] = u32::MAX;
+            }
+        }
+        rodata.kp_smt_pair = if opts.smt_pair != 0 && topo.smt_enabled && nr_smt_cpus > 0 {
+            1
+        } else {
+            0
+        };
+        rodata.kp_smt_lat_runtime_ns = opts.smt_lat_runtime_us.saturating_mul(1000);
+        rodata.kp_smt_lat_sleep_pct = opts.smt_lat_sleep_pct;
+        rodata.kp_smt_cpu_pct = opts.smt_cpu_pct;
+        info!(
+            "SMT pairing: {} ({} SMT CPUs detected, smt_enabled={})",
+            if rodata.kp_smt_pair != 0 { "on" } else { "off" },
+            nr_smt_cpus,
+            topo.smt_enabled
+        );
+
         let mut skel = scx_ops_load!(skel, kp_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, kp_ops)?);
 
@@ -209,8 +257,45 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
+        let mut ticks = 0u64;
+        let mut last = (0u64, 0u64, 0u64);
+        let mut last_runs = (0u64, 0u64, 0u64);
+
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            ticks += 1;
+            if ticks % 10 != 0 {
+                continue;
+            }
+
+            let bss = self.skel.maps.bss_data.as_ref().unwrap();
+            let sleep = bss.nr_sleep_stop;
+            let slice_end = bss.nr_slice_end_stop;
+            let preempt = bss.nr_preempt_stop;
+            let total = sleep + slice_end + preempt;
+            let pct = |v: u64| if total > 0 { v * 100 / total } else { 0 };
+            println!(
+                "[{:5}] stops total={} | sleep={} ({:3}%) preempt={} ({:3}%) slice_end={} ({:3}%) | d: sleep={} preempt={} slice_end={} | smt runs: lat={} (+{}) cpu_bound={} (+{}) mixed={} (+{})",
+                ticks / 10,
+                total,
+                sleep,
+                pct(sleep),
+                preempt,
+                pct(preempt),
+                slice_end,
+                pct(slice_end),
+                sleep - last.0,
+                preempt - last.2,
+                slice_end - last.1,
+                bss.nr_run_lat,
+                bss.nr_run_lat - last_runs.0,
+                bss.nr_run_cpu_bound,
+                bss.nr_run_cpu_bound - last_runs.1,
+                bss.nr_run_mixed,
+                bss.nr_run_mixed - last_runs.2
+            );
+            last = (sleep, slice_end, preempt);
+            last_runs = (bss.nr_run_lat, bss.nr_run_cpu_bound, bss.nr_run_mixed);
         }
 
         let _ = self.struct_ops.take();
