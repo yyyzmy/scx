@@ -202,7 +202,7 @@ void BPF_STRUCT_OPS(partial_disable, struct task_struct *p)
 void BPF_STRUCT_OPS(partial_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	bool cpu_selected;
-	s32 prev_cpu;
+	s32 prev_cpu, cpu;
 	u64 slice;
 
 	cpu_selected = __COMPAT_is_enq_cpu_selected(enq_flags);
@@ -210,20 +210,45 @@ void BPF_STRUCT_OPS(partial_enqueue, struct task_struct *p, u64 enq_flags)
 	prev_cpu = scx_bpf_task_cpu(p);
 	slice = partial_slice_ns ? partial_slice_ns : SCX_SLICE_DFL;
 
-	if (prev_cpu < 0 || !cpu_in_range(prev_cpu) ||
-	    !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
-		/* Fall back to shared DSQ */
-		scx_bpf_dsq_insert(p, SHARED_DSQ, slice, enq_flags);
-		if (!cpu_selected)
-			scx_bpf_kick_cpu(PARTIAL_CPU_MIN, SCX_KICK_IDLE);
+	/* Normal path: per-CPU DSQ on prev_cpu → only prev_cpu pulls it */
+	if (prev_cpu >= 0 && cpu_in_range(prev_cpu) &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+		scx_bpf_dsq_insert(p, cpu_dsq_id(prev_cpu), slice, enq_flags);
+		if (!cpu_selected && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 		return;
 	}
 
-	/* Per-CPU DSQ: task stays on its prev_cpu → no migration */
-	scx_bpf_dsq_insert(p, cpu_dsq_id(prev_cpu), slice, enq_flags);
+	/*
+	 * First entry (prev_cpu out of range): scan 80-87 in order and
+	 * take the first idle CPU → deterministic placement, no shared DSQ.
+	 */
+	bpf_for(cpu, PARTIAL_CPU_MIN, PARTIAL_CPU_MAX + 1) {
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		if (!scx_bpf_test_and_clear_cpu_idle(cpu))
+			continue;
+		scx_bpf_dsq_insert(p, cpu_dsq_id(cpu), slice, enq_flags);
+		if (!cpu_selected)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		return;
+	}
 
-	if (!cpu_selected && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+	/*
+	 * No idle CPU in range: queue in order on the first allowed CPU
+	 * (task waits for that CPU instead of migrating to a busy one).
+	 */
+	bpf_for(cpu, PARTIAL_CPU_MIN, PARTIAL_CPU_MAX + 1) {
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		scx_bpf_dsq_insert(p, cpu_dsq_id(cpu), slice, enq_flags);
+		if (!cpu_selected)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		return;
+	}
+
+	/* Affinity excludes 80-87 entirely: last-resort shared DSQ */
+	scx_bpf_dsq_insert(p, SHARED_DSQ, slice, enq_flags);
 }
 
 /*
