@@ -20,7 +20,6 @@
 # ============================================================================
 
 import sys
-import re
 import argparse
 
 # ---- 拟合系数 (从 isc_fit.py 输出复制) ----
@@ -43,17 +42,11 @@ def clamp(x, lo=0.0, hi=1.0):
 
 
 # ---------------------------------------------------------------------------
-# 短名提取: 从长命令串里取 benchmark 编号, 否则截断
+# 名称处理: 直接用原名, 不截断不提取
 # ---------------------------------------------------------------------------
-SPEC_RE = re.compile(r'(\d{3}\.[\w_]+(?:_[\w_]+)?)')
-
-
 def short_name(full):
-    """从 runcpu 命令串里提取 benchmark 名 (如 500.perlbench_r)"""
-    m = SPEC_RE.search(full)
-    if m:
-        return m.group(1)
-    return full if len(full) <= 40 else full[:37] + "..."
+    """直接返回完整名称"""
+    return full
 
 
 # ---------------------------------------------------------------------------
@@ -107,26 +100,28 @@ def print_report(st_A, st_B, name_A, name_B):
 
     sA = short_name(name_A)
     sB = short_name(name_B)
+    # 自适应列宽: 取两名称较长者, 至少 8
+    nw = max(len(sA), len(sB), len("程序(共跑后)"), 8)
 
-    w = 66
+    w = max(66, nw + 50)
     print("=" * w)
     print("配对评估:  %s  +  %s" % (sA, sB))
     print("=" * w)
 
     print("\n【输入 ST 特征】")
-    print("  %-20s %8s %8s %8s %8s" % ("程序", "FEstall", "BEstall", "DIcyc", "Total"))
-    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % (sA, st_A["FE"], st_A["BE"], st_A["DI"],
+    print("  %-*s %8s %8s %8s %8s" % (nw, "程序", "FEstall", "BEstall", "DIcyc", "Total"))
+    print("  %-*s %8.4f %8.4f %8.4f %8.4f" % (nw, sA, st_A["FE"], st_A["BE"], st_A["DI"],
           st_A["FE"] + st_A["BE"] + st_A["DI"]))
-    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % (sB, st_B["FE"], st_B["BE"], st_B["DI"],
+    print("  %-*s %8.4f %8.4f %8.4f %8.4f" % (nw, sB, st_B["FE"], st_B["BE"], st_B["DI"],
           st_B["FE"] + st_B["BE"] + st_B["DI"]))
 
     print("\n【预测 SMT 栈】")
-    print("  %-20s %8s %8s %8s %8s" % ("程序(共跑后)", "FEstall", "BEstall", "DIcyc", "Total"))
+    print("  %-*s %8s %8s %8s %8s" % (nw, "程序(共跑后)", "FEstall", "BEstall", "DIcyc", "Total"))
     s = r["smt_A"]
-    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % ("%s|%s" % (sA, sB),
+    print("  %-*s %8.4f %8.4f %8.4f %8.4f" % (nw, "%s|%s" % (sA, sB),
           s["FE"], s["BE"], s["DI"], s["FE"] + s["BE"] + s["DI"]))
     s = r["smt_B"]
-    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % ("%s|%s" % (sB, sA),
+    print("  %-*s %8.4f %8.4f %8.4f %8.4f" % (nw, "%s|%s" % (sB, sA),
           s["FE"], s["BE"], s["DI"], s["FE"] + s["BE"] + s["DI"]))
 
     print("\n【干扰分解】 r×Ci×Cj 项 (正=竞争放大, 负=互补填补)")
@@ -137,10 +132,10 @@ def print_report(st_A, st_B, name_A, name_B):
         print("  %-9s %+8.4f  %s %s" % (CAT_NAMES[c], v, bar, sign))
 
     print("\n【性能预测】")
-    print("  %-20s  slowdown = %5.2fx  (DI: %.4f -> %.4f)" %
-          (sA, r["slow_A"], st_A["DI"], r["smt_A"]["DI"]))
-    print("  %-20s  slowdown = %5.2fx  (DI: %.4f -> %.4f)" %
-          (sB, r["slow_B"], st_B["DI"], r["smt_B"]["DI"]))
+    print("  %-*s  slowdown = %5.2fx  (DI: %.4f -> %.4f)" %
+          (nw, sA, r["slow_A"], st_A["DI"], r["smt_A"]["DI"]))
+    print("  %-*s  slowdown = %5.2fx  (DI: %.4f -> %.4f)" %
+          (nw, sB, r["slow_B"], st_B["DI"], r["smt_B"]["DI"]))
     print("  SMT 聚合吞吐增益 = %.2fx  (1.0=无增益, 2.0=理想)" % r["gain"])
 
     print("\n【结论】 %s — %s" % (tag, desc))
@@ -218,29 +213,24 @@ def best_pairing(st):
         result.append((a, b, gain, r))
     leftover = [a for a in apps if a not in used]
 
-    # 自适应列宽: 按短名算最长
-    short_names = {a: short_name(a) for a in st}
-    # 参与配对的程序
-    paired = []
-    for a, b, _, _ in result:
-        paired.append(short_names[a])
-        paired.append(short_names[b])
-    w = max((len(s) for s in paired), default=10)
-    w = min(w, 40)  # 上限 40
+    # 自适应列宽: 所有参与配对程序的最长名, 无上限
+    all_names = [short_name(a) for a in st]
+    w = max((len(s) for s in all_names), default=10)
 
-    print("=" * 66)
+    line_w = max(66, w * 2 + 30)
+    print("=" * line_w)
     print("最优配对方案 (贪心, 按增益排序)")
-    print("=" * 66)
+    print("=" * line_w)
     for a, b, gain, r in result:
         tag, _ = verdict(gain)
         print("  %-*s + %-*s  gain=%.2fx  %s" %
-              (w, short_names[a], w, short_names[b], gain, tag))
+              (w, short_name(a), w, short_name(b), gain, tag))
     if leftover:
-        print("  未配对(奇数): %s" % ", ".join(short_names[a] for a in leftover))
+        print("  未配对(奇数): %s" % ", ".join(short_name(a) for a in leftover))
 
     avg = sum(p[2] for p in result) / len(result) if result else 0
     print("\n  平均增益: %.2fx  (%d 对)" % (avg, len(result)))
-    print("=" * 66)
+    print("=" * line_w)
 
 
 # ---------------------------------------------------------------------------
