@@ -20,6 +20,7 @@
 # ============================================================================
 
 import sys
+import re
 import argparse
 
 # ---- 拟合系数 (从 isc_fit.py 输出复制) ----
@@ -42,15 +43,27 @@ def clamp(x, lo=0.0, hi=1.0):
 
 
 # ---------------------------------------------------------------------------
+# 短名提取: 从长命令串里取 benchmark 编号, 否则截断
+# ---------------------------------------------------------------------------
+SPEC_RE = re.compile(r'(\d{3}\.[\w_]+(?:_[\w_]+)?)')
+
+
+def short_name(full):
+    """从 runcpu 命令串里提取 benchmark 名 (如 500.perlbench_r)"""
+    m = SPEC_RE.search(full)
+    if m:
+        return m.group(1)
+    return full if len(full) <= 40 else full[:37] + "..."
+
+
+# ---------------------------------------------------------------------------
 # 核心评估
 # ---------------------------------------------------------------------------
 def evaluate(st_A, st_B, name_A="A", name_B="B"):
     """输入两组 ST 特征, 返回评估结果字典"""
-    # 预测 A|B 和 B|A 的 SMT 栈
     smt_A = {c: clamp(predict(c, st_A[c], st_B[c])) for c in CATS}
     smt_B = {c: clamp(predict(c, st_B[c], st_A[c])) for c in CATS}
 
-    # slowdown = DI_st / DI_smt (指令数不变, DI 降多少就慢多少)
     di_A_st = st_A["DI"]
     di_B_st = st_B["DI"]
     di_A_smt = smt_A["DI"]
@@ -59,11 +72,8 @@ def evaluate(st_A, st_B, name_A="A", name_B="B"):
     slow_A = di_A_st / di_A_smt if di_A_smt > 0.001 else 99.0
     slow_B = di_B_st / di_B_smt if di_B_smt > 0.001 else 99.0
 
-    # SMT 聚合吞吐增益 = 两个线程的 (1/slowdown) 之和
-    # 1.0 = 无增益(不如各跑各的); 2.0 = 理想完美 SMT
     gain = (1.0 / slow_A + 1.0 / slow_B)
 
-    # 干扰分解: r * Ci * Cj 项 (正=放大竞争, 负=互补填补)
     inter = {}
     for c in CATS:
         _, _, _, r = COEF[c]
@@ -95,25 +105,28 @@ def print_report(st_A, st_B, name_A, name_B):
     r = evaluate(st_A, st_B, name_A, name_B)
     tag, desc = verdict(r["gain"])
 
+    sA = short_name(name_A)
+    sB = short_name(name_B)
+
     w = 66
     print("=" * w)
-    print("配对评估:  %s  +  %s" % (name_A, name_B))
+    print("配对评估:  %s  +  %s" % (sA, sB))
     print("=" * w)
 
     print("\n【输入 ST 特征】")
-    print("  %-16s %8s %8s %8s %8s" % ("程序", "FEstall", "BEstall", "DIcyc", "Total"))
-    print("  %-16s %8.4f %8.4f %8.4f %8.4f" % (name_A, st_A["FE"], st_A["BE"], st_A["DI"],
+    print("  %-20s %8s %8s %8s %8s" % ("程序", "FEstall", "BEstall", "DIcyc", "Total"))
+    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % (sA, st_A["FE"], st_A["BE"], st_A["DI"],
           st_A["FE"] + st_A["BE"] + st_A["DI"]))
-    print("  %-16s %8.4f %8.4f %8.4f %8.4f" % (name_B, st_B["FE"], st_B["BE"], st_B["DI"],
+    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % (sB, st_B["FE"], st_B["BE"], st_B["DI"],
           st_B["FE"] + st_B["BE"] + st_B["DI"]))
 
     print("\n【预测 SMT 栈】")
-    print("  %-16s %8s %8s %8s %8s" % ("程序(共跑后)", "FEstall", "BEstall", "DIcyc", "Total"))
+    print("  %-20s %8s %8s %8s %8s" % ("程序(共跑后)", "FEstall", "BEstall", "DIcyc", "Total"))
     s = r["smt_A"]
-    print("  %-16s %8.4f %8.4f %8.4f %8.4f" % ("%s|%s" % (name_A, name_B),
+    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % ("%s|%s" % (sA, sB),
           s["FE"], s["BE"], s["DI"], s["FE"] + s["BE"] + s["DI"]))
     s = r["smt_B"]
-    print("  %-16s %8.4f %8.4f %8.4f %8.4f" % ("%s|%s" % (name_B, name_A),
+    print("  %-20s %8.4f %8.4f %8.4f %8.4f" % ("%s|%s" % (sB, sA),
           s["FE"], s["BE"], s["DI"], s["FE"] + s["BE"] + s["DI"]))
 
     print("\n【干扰分解】 r×Ci×Cj 项 (正=竞争放大, 负=互补填补)")
@@ -124,10 +137,10 @@ def print_report(st_A, st_B, name_A, name_B):
         print("  %-9s %+8.4f  %s %s" % (CAT_NAMES[c], v, bar, sign))
 
     print("\n【性能预测】")
-    print("  %-16s  slowdown = %5.2fx  (DI: %.4f → %.4f)" %
-          (name_A, r["slow_A"], st_A["DI"], r["smt_A"]["DI"]))
-    print("  %-16s  slowdown = %5.2fx  (DI: %.4f → %.4f)" %
-          (name_B, r["slow_B"], st_B["DI"], r["smt_B"]["DI"]))
+    print("  %-20s  slowdown = %5.2fx  (DI: %.4f -> %.4f)" %
+          (sA, r["slow_A"], st_A["DI"], r["smt_A"]["DI"]))
+    print("  %-20s  slowdown = %5.2fx  (DI: %.4f -> %.4f)" %
+          (sB, r["slow_B"], st_B["DI"], r["smt_B"]["DI"]))
     print("  SMT 聚合吞吐增益 = %.2fx  (1.0=无增益, 2.0=理想)" % r["gain"])
 
     print("\n【结论】 %s — %s" % (tag, desc))
@@ -205,17 +218,26 @@ def best_pairing(st):
         result.append((a, b, gain, r))
     leftover = [a for a in apps if a not in used]
 
+    # 自适应列宽: 按短名算最长
+    short_names = {a: short_name(a) for a in st}
+    # 参与配对的程序
+    paired = []
+    for a, b, _, _ in result:
+        paired.append(short_names[a])
+        paired.append(short_names[b])
+    w = max((len(s) for s in paired), default=10)
+    w = min(w, 40)  # 上限 40
+
     print("=" * 66)
     print("最优配对方案 (贪心, 按增益排序)")
     print("=" * 66)
     for a, b, gain, r in result:
         tag, _ = verdict(gain)
-        print("  %-20s + %-20s  gain=%.2fx  %s" %
-              (a[:20], b[:20], gain, tag))
+        print("  %-*s + %-*s  gain=%.2fx  %s" %
+              (w, short_names[a], w, short_names[b], gain, tag))
     if leftover:
-        print("  未配对 (奇数): %s" % ", ".join(leftover))
+        print("  未配对(奇数): %s" % ", ".join(short_names[a] for a in leftover))
 
-    # 汇总
     avg = sum(p[2] for p in result) / len(result) if result else 0
     print("\n  平均增益: %.2fx  (%d 对)" % (avg, len(result)))
     print("=" * 66)
@@ -237,7 +259,7 @@ def main():
     ap.add_argument("-i", "--interactive", action="store_true", help="交互模式")
     args = ap.parse_args()
 
-    # 模式 0: 系数自检
+    # 无参数: 打印帮助和系数
     if not any([args.fe_a, args.csv, args.best, args.interactive]):
         ap.print_help()
         print("\n当前嵌入系数:")
@@ -259,7 +281,7 @@ def main():
         best_pairing(st_db)
         return
 
-    # 模式 2: 从 CSV 查程序
+    # 模式 2: 从 CSV 查两个程序
     if args.csv and len(sys.argv) >= 4:
         name_A = sys.argv[-2]
         name_B = sys.argv[-1]
@@ -283,8 +305,11 @@ def main():
     # 模式 4: 交互
     if args.interactive:
         if st_db:
-            print("已知程序: %s" % ", ".join(st_db))
-        print("输入格式: 名称 FE BE DI (空行结束)\n")
+            print("已知程序:")
+            for full, s in sorted(st_db.items(), key=lambda x: short_name(x[0])):
+                print("  %s  (FE=%.4f BE=%.4f DI=%.4f)" % (short_name(full), st_db[full]["FE"],
+                      st_db[full]["BE"], st_db[full]["DI"]))
+        print("\n输入格式: 名称 FE BE DI (空行结束)\n")
         progs = {}
         while True:
             line = input("程序 %d: " % (len(progs) + 1)).strip()
@@ -302,7 +327,6 @@ def main():
         if len(progs) < 2:
             return
         names = list(progs.keys())
-        # 两两评估
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
                 print_report(progs[names[i]], progs[names[j]], names[i], names[j])
