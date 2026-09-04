@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "7c145b26f225819cd711e20aa3f68c50b4493f8c",
+  "prompts": {},
+  "humans": {
+    "h_f43ce245beac25": {
+      "author": "ye yiyang <850219375@qq.com>"
+    }
+  }
+}
