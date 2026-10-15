@@ -150,7 +150,7 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(knobs_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 }
 
 void BPF_STRUCT_OPS(knobs_running, struct task_struct *p)
