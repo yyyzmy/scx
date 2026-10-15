@@ -181,7 +181,7 @@ impl<'a> Scheduler<'a> {
         &mut self,
         shutdown: Arc<AtomicBool>,
         opts: &Opts,
-        cmd_rx: mpsc::Receiver<Cmd>,
+        cmd_rx: &mpsc::Receiver<Cmd>,
     ) -> Result<UserExitInfo> {
         let interval = Duration::from_millis(opts.interval_ms.max(100));
         let mut tick = 0u64;
@@ -197,7 +197,7 @@ impl<'a> Scheduler<'a> {
 
             // Apply pending stdin commands
             while let Ok(cmd) = cmd_rx.try_recv() {
-                let mut bss = self.skel.maps.bss_data.as_mut().unwrap();
+                let bss = self.skel.maps.bss_data.as_mut().unwrap();
                 match cmd {
                     Cmd::SliceMs(v) => {
                         bss.slice_ns = if v > 0 { v * MSEC } else { 0 };
@@ -296,7 +296,7 @@ fn main() -> Result<()> {
     let mut open_object = MaybeUninit::uninit();
     loop {
         let mut sched = Scheduler::init(&opts, &mut open_object)?;
-        let uei = sched.run(shutdown.clone(), &opts, cmd_rx.clone())?;
+        let uei = sched.run(shutdown.clone(), &opts, &cmd_rx)?;
         if !uei.should_restart() {
             break;
         }
