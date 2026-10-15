@@ -10,7 +10,7 @@
 #          bash run_mock_test.sh 10 mix 8 4       # explicit thread counts
 #
 # Env:
-#   BIN  path to scx_knobs (default: <repo>/target/release/scx_knobs)
+#   BIN  path to scx_knobs (default hardcoded below)
 #
 # Phases (each 2x duration_s; halves are reported separately):
 #   A  defaults, then at half-time `gran 20000` is sent on stdin
@@ -30,8 +30,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-BIN=${BIN:-"$SCRIPT_DIR/../../../target/release/scx_knobs"}
 DUR=${1:-10}
+BIN=${BIN:-/home/y3/scx/target/release/scx_knobs}
 if [ $# -gt 0 ]; then shift; fi
 if [ $# -gt 0 ]; then MODE_ARGS=("$@"); else MODE_ARGS=(mix); fi
 
