@@ -78,6 +78,7 @@ enum Cmd {
     SliceMs(u64),
     PeriodMs(u64),
     GranUs(u64),
+    NoSwitch(bool),
 }
 
 fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
@@ -103,6 +104,11 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     .get(1)
                     .and_then(|s| s.parse::<u64>().ok())
                     .map(Cmd::GranUs),
+                "noswitch" => match t.get(1) {
+                    Some(&"on") => Some(Cmd::NoSwitch(true)),
+                    Some(&"off") => Some(Cmd::NoSwitch(false)),
+                    _ => None,
+                },
                 _ => None,
             };
             match cmd {
@@ -112,8 +118,8 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     }
                 }
                 None => eprintln!(
-                    "unknown command: {line}  (try: slice MS | period MS | gran US)"
-                ),
+                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off)"
+                    ),
             }
         }
     });
@@ -147,7 +153,7 @@ impl<'a> Scheduler<'a> {
             ms_str(opts.period_ms, "off"),
             opts.gran_us
         );
-        info!("stdin commands: slice MS | period MS | gran US");
+        info!("stdin commands: slice MS | period MS | gran US | noswitch on|off");
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
@@ -190,6 +196,7 @@ impl<'a> Scheduler<'a> {
         let mut cur_slice_ms = opts.slice_ms;
         let mut cur_period_ms = opts.period_ms;
         let mut cur_gran_us = opts.gran_us;
+        let mut cur_noswitch = false;
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(interval);
@@ -213,6 +220,14 @@ impl<'a> Scheduler<'a> {
                         bss.wakeup_gran_ns = v * USEC;
                         cur_gran_us = v;
                         println!("wakeup_gran -> {v} us");
+                    }
+                    Cmd::NoSwitch(on) => {
+                        bss.no_switch = u64::from(on);
+                        cur_noswitch = on;
+                        println!(
+                            "no_switch -> {}",
+                            if on { "ON (run-to-completion)" } else { "off" }
+                        );
                     }
                 }
             }
@@ -238,10 +253,11 @@ impl<'a> Scheduler<'a> {
             last = cur;
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us | stops: sleep={} slice_end={} preempt={} | wake-preempt={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} | queue: local={} global={}",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
+                if cur_noswitch { "on" } else { "off" },
                 d.0,
                 d.1,
                 d.2,

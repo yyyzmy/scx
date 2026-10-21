@@ -27,6 +27,13 @@
  *                   to CFS default); >= one slice => wakeup preemption
  *                   fully off (fewest involuntary switches).
  *
+ *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
+ *                   wakeup preemption never armed. A task keeps its CPU
+ *                   until it blocks or yields -- zero involuntary
+ *                   switches, at the price of starving everything queued
+ *                   behind it (the degenerate corner the three knobs
+ *                   above exist to avoid).
+ *
  * Switch attribution counters (userspace prints per-interval deltas):
  *   nr_sleep_stop / nr_slice_end_stop / nr_preempt_stop: voluntary vs
  *     involuntary split, aligned with /proc/<pid>/status semantics
@@ -40,6 +47,7 @@ char _license[] SEC("license") = "GPL";
 volatile u64 slice_ns;       /* ~ sched_min_granularity_ns, 0 => SCX_SLICE_DFL */
 volatile u64 period_ns;      /* ~ sched_latency_ns, 0 => static slice mode */
 volatile u64 wakeup_gran_ns; /* ~ sched_wakeup_granularity_ns */
+volatile u64 no_switch;      /* 1 = run-to-completion: SCX_SLICE_INF, no preempt */
 
 static u64 vtime_now;
 UEI_DEFINE(uei);
@@ -68,6 +76,9 @@ struct {
 static __always_inline u64 eff_slice(void)
 {
 	u64 slice = slice_ns ? slice_ns : SCX_SLICE_DFL;
+
+	if (no_switch)
+		return SCX_SLICE_INF;
 
 	if (period_ns) {
 		u64 nr = scx_bpf_dsq_nr_queued(SHARED_DSQ) + 1;
@@ -127,6 +138,19 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 
 	__sync_fetch_and_add(&nr_global_q, 1);
 
+	if (no_switch) {
+		/*
+		 * Run-to-completion: infinite slice, FIFO order, and never
+		 * SCX_ENQ_PREEMPT. The task owns its CPU until it blocks,
+		 * yields, or the load goes away. Skip the vtime clamp and
+		 * preempt gate below -- the credit cap uses slice arithmetic
+		 * that would underflow with SCX_SLICE_INF.
+		 */
+		note_assigned_slice(p, slice);
+		scx_bpf_dsq_insert(p, SHARED_DSQ, slice, enq_flags);
+		return;
+	}
+
 	/* cap sleeper bonus at one slice (scx_simple behavior) */
 	if (time_before(vtime, vtime_now - slice))
 		vtime = vtime_now - slice;
@@ -185,7 +209,7 @@ void BPF_STRUCT_OPS(knobs_stopping, struct task_struct *p, bool runnable)
 	 * tradeoff scx_simple documents.
 	 */
 	assigned = tctx ? tctx->slice_assigned : SCX_SLICE_DFL;
-	if (assigned > p->scx.slice)
+	if (!no_switch && assigned > p->scx.slice)
 		p->scx.dsq_vtime +=
 			(assigned - p->scx.slice) * 100 / p->scx.weight;
 }
