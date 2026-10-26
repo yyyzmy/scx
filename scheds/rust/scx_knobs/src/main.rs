@@ -261,6 +261,7 @@ impl<'a> Scheduler<'a> {
                 bss.nr_slice_end_stop,
                 bss.nr_preempt_stop,
                 bss.nr_wakeup_preempt,
+                bss.nr_kick,
                 bss.nr_local_q,
                 bss.nr_global_q,
             );
@@ -271,11 +272,12 @@ impl<'a> Scheduler<'a> {
                 cur.3 - last.3,
                 cur.4 - last.4,
                 cur.5 - last.5,
+                cur.6 - last.6,
             );
             last = cur;
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} kick={} | queue: local={} global={}",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
@@ -287,6 +289,7 @@ impl<'a> Scheduler<'a> {
                 d.3,
                 d.4,
                 d.5,
+                d.6,
             );
         }
 

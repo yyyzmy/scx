@@ -32,6 +32,12 @@
  *                   gate below. The eager end of the spectrum: a task that
  *                   wakes up kicks whatever is running no matter how short
  *                   its sleep was (EEVDF-like immediate wakeup preemption).
+ *                   Note this needs an explicit scx_bpf_kick_cpu() below:
+ *                   SCX_ENQ_PREEMPT on its own only pends the target rq for
+ *                   resched, and a task spinning in userspace sees that at
+ *                   its next tick (up to 1/HZ) -- indistinguishable from
+ *                   "waiting for the slice to end". The kick sends the IPI
+ *                   and switches right away.
  *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
@@ -46,6 +52,7 @@
  *   nr_sleep_stop / nr_slice_end_stop / nr_preempt_stop: voluntary vs
  *     involuntary split, aligned with /proc/<pid>/status semantics
  *   nr_wakeup_preempt: enqueues that carried SCX_ENQ_PREEMPT
+ *   nr_kick: explicit SCX_KICK_PREEMPT IPIs sent to force the switch now
  *   nr_local_q / nr_global_q: direct-dispatched vs shared-DSQ queued
  */
 #include <scx/common.bpf.h>
@@ -67,6 +74,7 @@ u64 nr_sleep_stop;      /* voluntary: blocked */
 u64 nr_slice_end_stop;  /* involuntary: slice exhausted */
 u64 nr_preempt_stop;    /* involuntary: preempted early (slice > 0 left) */
 u64 nr_wakeup_preempt;  /* enqueues that carried SCX_ENQ_PREEMPT */
+u64 nr_kick;            /* explicit SCX_KICK_PREEMPT IPIs */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on the shared DSQ */
 
@@ -180,6 +188,21 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 
 	note_assigned_slice(p, slice);
 	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime, enq_flags);
+
+	/*
+	 * A shared-DSQ insert only pends the target rq for resched. A task
+	 * spinning in userspace does not check TIF_NEED_RESCHED until its
+	 * next tick, so the "preemption" would land at the next tick or slice
+	 * boundary -- i.e. it would look exactly like no preemption at all.
+	 * Kick the target CPU to send the resched IPI and switch right now.
+	 * The kick must come *after* the insert: the target CPU dispatches
+	 * from SHARED_DSQ as soon as it handles the IPI, and must find the
+	 * task already queued.
+	 */
+	if (enq_flags & SCX_ENQ_PREEMPT) {
+		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
+		__sync_fetch_and_add(&nr_kick, 1);
+	}
 }
 
 void BPF_STRUCT_OPS(knobs_dispatch, s32 cpu, struct task_struct *prev)
