@@ -204,8 +204,8 @@ impl<'a> Scheduler<'a> {
     ) -> Result<UserExitInfo> {
         let interval = Duration::from_millis(opts.interval_ms.max(100));
         let mut tick = 0u64;
-        // sleep, slice_end, preempt, wake-preempt, q-local, q-global
-        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // sleep, slice_end, preempt, wake-preempt, kick, q-local, q-global
+        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut cur_slice_ms = opts.slice_ms;
         let mut cur_period_ms = opts.period_ms;
         let mut cur_gran_us = opts.gran_us;
