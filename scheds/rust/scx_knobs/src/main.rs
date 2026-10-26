@@ -65,6 +65,11 @@ struct Opts {
     #[clap(long, default_value_t = 1000)]
     gran_us: u64,
 
+    /// Eager wakeup preemption: every waking task kicks the current runner
+    /// immediately, ignoring --gran-us. Runtime-tunable: `preempt on|off`.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    always_preempt: bool,
+
     /// Stats printing interval in ms (default 1000).
     #[clap(long, default_value_t = 1000)]
     interval_ms: u64,
@@ -79,6 +84,7 @@ enum Cmd {
     PeriodMs(u64),
     GranUs(u64),
     NoSwitch(bool),
+    AlwaysPreempt(bool),
 }
 
 fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
@@ -109,6 +115,11 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     Some(&"off") => Some(Cmd::NoSwitch(false)),
                     _ => None,
                 },
+                "preempt" => match t.get(1) {
+                    Some(&"on") => Some(Cmd::AlwaysPreempt(true)),
+                    Some(&"off") => Some(Cmd::AlwaysPreempt(false)),
+                    _ => None,
+                },
                 _ => None,
             };
             match cmd {
@@ -118,7 +129,7 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     }
                 }
                 None => eprintln!(
-                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off)"
+                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off)"
                     ),
             }
         }
@@ -148,12 +159,13 @@ impl<'a> Scheduler<'a> {
             SCHEDULER_NAME
         );
         info!(
-            "knobs: slice={} period={} gran={}us",
+            "knobs: slice={} period={} gran={}us preempt={}",
             ms_str(opts.slice_ms, "dfl"),
             ms_str(opts.period_ms, "off"),
-            opts.gran_us
+            opts.gran_us,
+            if opts.always_preempt { "always" } else { "gated" }
         );
-        info!("stdin commands: slice MS | period MS | gran US | noswitch on|off");
+        info!("stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off");
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
@@ -171,6 +183,7 @@ impl<'a> Scheduler<'a> {
             };
             bss.period_ns = opts.period_ms * MSEC;
             bss.wakeup_gran_ns = opts.gran_us * USEC;
+            bss.always_preempt = u64::from(opts.always_preempt);
         }
 
         let mut skel = scx_ops_load!(skel, knobs_ops, uei)?;
@@ -197,6 +210,7 @@ impl<'a> Scheduler<'a> {
         let mut cur_period_ms = opts.period_ms;
         let mut cur_gran_us = opts.gran_us;
         let mut cur_noswitch = false;
+        let mut cur_preempt = opts.always_preempt;
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(interval);
@@ -229,6 +243,14 @@ impl<'a> Scheduler<'a> {
                             if on { "ON (run-to-completion)" } else { "off" }
                         );
                     }
+                    Cmd::AlwaysPreempt(on) => {
+                        bss.always_preempt = u64::from(on);
+                        cur_preempt = on;
+                        println!(
+                            "always_preempt -> {}",
+                            if on { "ON (every wakeup preempts)" } else { "off" }
+                        );
+                    }
                 }
             }
 
@@ -253,11 +275,12 @@ impl<'a> Scheduler<'a> {
             last = cur;
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} | queue: local={} global={}",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
                 if cur_noswitch { "on" } else { "off" },
+                if cur_preempt { "always" } else { "gated" },
                 d.0,
                 d.1,
                 d.2,

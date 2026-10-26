@@ -27,12 +27,20 @@
  *                   to CFS default); >= one slice => wakeup preemption
  *                   fully off (fewest involuntary switches).
  *
+ *   always_preempt  1 => every enqueue carrying SCX_ENQ_WAKEUP preempts the
+ *                   current runner unconditionally, bypassing the credit
+ *                   gate below. The eager end of the spectrum: a task that
+ *                   wakes up kicks whatever is running no matter how short
+ *                   its sleep was (EEVDF-like immediate wakeup preemption).
+ *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
  *                   until it blocks or yields -- zero involuntary
  *                   switches, at the price of starving everything queued
  *                   behind it (the degenerate corner the three knobs
- *                   above exist to avoid).
+ *                   above exist to avoid). ops.tick rewrites the slice of
+ *                   already-running tasks, so the freeze (and unfreeze)
+ *                   takes effect within one kernel tick, not one slice.
  *
  * Switch attribution counters (userspace prints per-interval deltas):
  *   nr_sleep_stop / nr_slice_end_stop / nr_preempt_stop: voluntary vs
@@ -47,6 +55,7 @@ char _license[] SEC("license") = "GPL";
 volatile u64 slice_ns;       /* ~ sched_min_granularity_ns, 0 => SCX_SLICE_DFL */
 volatile u64 period_ns;      /* ~ sched_latency_ns, 0 => static slice mode */
 volatile u64 wakeup_gran_ns; /* ~ sched_wakeup_granularity_ns */
+volatile u64 always_preempt; /* 1 = every waking task preempts (gate bypassed) */
 volatile u64 no_switch;      /* 1 = run-to-completion: SCX_SLICE_INF, no preempt */
 
 static u64 vtime_now;
@@ -163,7 +172,8 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * recently-charged tasks (vtime > vtime_now) compare negative.
 	 */
 	credit = vtime_now - vtime;
-	if ((enq_flags & SCX_ENQ_WAKEUP) && (s64)credit > (s64)wakeup_gran_ns) {
+	if ((enq_flags & SCX_ENQ_WAKEUP) &&
+	    (always_preempt || (s64)credit > (s64)wakeup_gran_ns)) {
 		enq_flags |= SCX_ENQ_PREEMPT;
 		__sync_fetch_and_add(&nr_wakeup_preempt, 1);
 	}
@@ -175,6 +185,30 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(knobs_dispatch, s32 cpu, struct task_struct *prev)
 {
 	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
+}
+
+void BPF_STRUCT_OPS(knobs_tick, struct task_struct *p)
+{
+	/*
+	 * Zero-latency knob application. A task's slice is stamped at enqueue
+	 * time, so a knob change otherwise waits for the current slice to
+	 * expire (up to one old slice). Rewrite the *remaining* slice of the
+	 * running task every tick instead:
+	 *
+	 *   no_switch=1  -> extend to SCX_SLICE_INF: the freeze takes effect
+	 *                   within one kernel tick instead of one slice.
+	 *   no_switch=0  -> any task still carrying a (near-)INF remaining
+	 *                   slice was frozen earlier; hand it a fresh normal
+	 *                   slice so the off-transition is reversible too.
+	 *                   (Detection by value: nothing legitimate exceeds
+	 *                   SCX_SLICE_INF/2, and decrements since the last
+	 *                   tick can only shave a tick's worth off INF.)
+	 */
+	if (no_switch) {
+		p->scx.slice = SCX_SLICE_INF;
+	} else if (p->scx.slice > SCX_SLICE_INF / 2) {
+		p->scx.slice = slice_ns ? slice_ns : SCX_SLICE_DFL;
+	}
 }
 
 void BPF_STRUCT_OPS(knobs_running, struct task_struct *p)
@@ -233,6 +267,7 @@ SCX_OPS_DEFINE(knobs_ops,
 	       .select_cpu	= (void *)knobs_select_cpu,
 	       .enqueue		= (void *)knobs_enqueue,
 	       .dispatch	= (void *)knobs_dispatch,
+	       .tick		= (void *)knobs_tick,
 	       .running		= (void *)knobs_running,
 	       .stopping		= (void *)knobs_stopping,
 	       .enable		= (void *)knobs_enable,
