@@ -14,6 +14,7 @@
  *
  * SIGINT/SIGTERM stop all threads gracefully.
  */
+#define _GNU_SOURCE
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -21,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -53,9 +55,19 @@ static void burn_us(long us)
 	} while (now.tv_sec * 1000000L + now.tv_nsec / 1000 < target);
 }
 
+/* name each thread uniquely (mock_cpu0, mock_io3, ...) and log its tid */
+static void name_thread(const char *prefix, int idx)
+{
+	char name[16];		/* TASK_COMM_LEN - 1 */
+
+	snprintf(name, sizeof(name), "%s%d", prefix, idx);
+	pthread_setname_np(pthread_self(), name);
+	fprintf(stderr, "mock_load: %s tid=%ld\n", name, (long)syscall(SYS_gettid));
+}
+
 static void *cpu_thread(void *arg)
 {
-	(void)arg;
+	name_thread("mock_cpu", (int)(long)arg);
 	while (atomic_load(&running))
 		burn_us(100000);	/* 100ms compute bursts, never sleeps */
 	return NULL;
@@ -63,7 +75,7 @@ static void *cpu_thread(void *arg)
 
 static void *io_thread(void *arg)
 {
-	(void)arg;
+	name_thread("mock_io", (int)(long)arg);
 	while (atomic_load(&running)) {
 		burn_us(200);		/* short compute */
 		usleep(5000);		/* 5ms sleep -> wakeup with banked credit */
@@ -74,7 +86,7 @@ static void *io_thread(void *arg)
 static void spawn(pthread_t *tids, int n, void *(*fn)(void *))
 {
 	for (int i = 0; i < n; i++) {
-		if (pthread_create(&tids[i], NULL, fn, NULL)) {
+		if (pthread_create(&tids[i], NULL, fn, (void *)(long)i)) {
 			perror("pthread_create");
 			exit(1);
 		}
