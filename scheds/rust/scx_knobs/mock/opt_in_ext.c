@@ -53,7 +53,7 @@ struct sched_attr_v0 {
 
 static int set_policy(pid_t tid, int restore)
 {
-	const char *name = restore ? "SCHED_NORMAL" : "SCHED_EXT";
+	const char *name = restore ? "SCHED_OTHER" : "SCHED_EXT";
 	struct sched_attr_v0 attr;
 	int err;
 
@@ -67,7 +67,7 @@ static int set_policy(pid_t tid, int restore)
 		nice = getpriority(PRIO_PROCESS, (id_t)tid);
 		if (nice == -1 && errno)
 			nice = 0;	/* thread is gone; let the call report it */
-		attr.sched_policy = SCHED_NORMAL;
+		attr.sched_policy = SCHED_OTHER;	/* SCHED_NORMAL, value 0 */
 		attr.sched_nice = nice;
 	} else {
 		attr.sched_policy = SCHED_EXT;
