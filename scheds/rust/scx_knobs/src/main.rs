@@ -2,7 +2,8 @@
 //
 // scx_knobs: the CFS tuning trio rebuilt on sched_ext (see src/bpf/main.bpf.c
 // for the knob semantics). Based on scx_simple's global weighted vtime
-// scheduling; takes over ALL tasks.
+// scheduling; takes over ALL tasks by default, or only SCHED_EXT tasks
+// with --partial (SCX_OPS_SWITCH_PARTIAL, restart required to toggle).
 //
 //   --slice-ms   ~ sched_min_granularity_ns   (base slice, floor for period)
 //   --period-ms  ~ sched_latency_ns            (0 = static, >0 = period/n)
@@ -25,6 +26,7 @@ use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
 use log::info;
+use scx_utils::compat;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
@@ -69,6 +71,14 @@ struct Opts {
     /// immediately, ignoring --gran-us. Runtime-tunable: `preempt on|off`.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     always_preempt: bool,
+
+    /// Partial takeover (SCX_OPS_SWITCH_PARTIAL): only tasks explicitly moved
+    /// to the SCHED_EXT policy are scheduled by this BPF scheduler, everything
+    /// else stays on CFS. Opt in with `chrt -E -a -p <pid>`. Note that the ext
+    /// class ranks BELOW fair, so these tasks cannot preempt CFS tasks.
+    /// Fixed at load time -- restart the scheduler to toggle.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    partial: bool,
 
     /// Stats printing interval in ms (default 1000).
     #[clap(long, default_value_t = 1000)]
@@ -154,10 +164,18 @@ impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         try_set_rlimit_infinity();
 
-        info!(
-            "{} takes over ALL tasks (scx_simple-style global vtime scheduling)",
-            SCHEDULER_NAME
-        );
+        if opts.partial {
+            info!(
+                "{} takes over SCHED_EXT tasks only (SCX_OPS_SWITCH_PARTIAL); \
+                 opt in with `chrt -E -a -p <pid>`",
+                SCHEDULER_NAME
+            );
+        } else {
+            info!(
+                "{} takes over ALL tasks (scx_simple-style global vtime scheduling)",
+                SCHEDULER_NAME
+            );
+        }
         info!(
             "knobs: slice={} period={} gran={}us preempt={}",
             ms_str(opts.slice_ms, "dfl"),
@@ -171,6 +189,12 @@ impl<'a> Scheduler<'a> {
         skel_builder.obj_builder.debug(opts.verbose);
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, knobs_ops, open_opts)?;
+
+        // Fixed at load time: only tasks carrying the SCHED_EXT policy are
+        // handed to us; everything else remains on CFS.
+        if opts.partial {
+            skel.struct_ops.knobs_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
+        }
 
         // Write BSS before load so the knobs are effective from the first
         // callback; stdin commands update the same variables.
