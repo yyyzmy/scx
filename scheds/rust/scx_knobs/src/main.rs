@@ -228,8 +228,8 @@ impl<'a> Scheduler<'a> {
     ) -> Result<UserExitInfo> {
         let interval = Duration::from_millis(opts.interval_ms.max(100));
         let mut tick = 0u64;
-        // sleep, slice_end, preempt, wake-preempt, kick, q-local, q-global
-        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // sleep, slice_end, preempt, wake-preempt, exp-preempt, kick, q-local, q-global
+        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut cur_slice_ms = opts.slice_ms;
         let mut cur_period_ms = opts.period_ms;
         let mut cur_gran_us = opts.gran_us;
@@ -285,6 +285,7 @@ impl<'a> Scheduler<'a> {
                 bss.nr_slice_end_stop,
                 bss.nr_preempt_stop,
                 bss.nr_wakeup_preempt,
+                bss.nr_expired_preempt,
                 bss.nr_kick,
                 bss.nr_local_q,
                 bss.nr_global_q,
@@ -297,11 +298,12 @@ impl<'a> Scheduler<'a> {
                 cur.4 - last.4,
                 cur.5 - last.5,
                 cur.6 - last.6,
+                cur.7 - last.7,
             );
             last = cur;
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} kick={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} exp-pm={} kick={} | queue: local={} global={}",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
@@ -314,6 +316,7 @@ impl<'a> Scheduler<'a> {
                 d.4,
                 d.5,
                 d.6,
+                d.7,
             );
         }
 

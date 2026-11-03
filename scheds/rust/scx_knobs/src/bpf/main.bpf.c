@@ -52,6 +52,8 @@
  *   nr_sleep_stop / nr_slice_end_stop / nr_preempt_stop: voluntary vs
  *     involuntary split, aligned with /proc/<pid>/status semantics
  *   nr_wakeup_preempt: enqueues that carried SCX_ENQ_PREEMPT
+ *   nr_expired_preempt: wakeups promoted to preemption because the runner on
+ *     the target CPU had already used up its slice (timing fix, not budget)
  *   nr_kick: explicit SCX_KICK_PREEMPT IPIs sent to force the switch now
  *   nr_local_q / nr_global_q: direct-dispatched vs shared-DSQ queued
  */
@@ -74,6 +76,7 @@ u64 nr_sleep_stop;      /* voluntary: blocked */
 u64 nr_slice_end_stop;  /* involuntary: slice exhausted */
 u64 nr_preempt_stop;    /* involuntary: preempted early (slice > 0 left) */
 u64 nr_wakeup_preempt;  /* enqueues that carried SCX_ENQ_PREEMPT */
+u64 nr_expired_preempt; /* wakeups that preempted an already-expired runner */
 u64 nr_kick;            /* explicit SCX_KICK_PREEMPT IPIs */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on the shared DSQ */
@@ -171,6 +174,26 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	/* cap sleeper bonus at one slice (scx_simple behavior) */
 	if (time_before(vtime, vtime_now - slice))
 		vtime = vtime_now - slice;
+
+	/*
+	 * Expired-victim fast path. If the runner on @p's target CPU has
+	 * already burned its whole slice (scx.slice == 0), the kernel is going
+	 * to switch it out at this tick anyway; promote the wakeup to an
+	 * immediate preemption so the newcomer does not wait for the tick to
+	 * take effect. This is a pure timing fix -- it never steals budget
+	 * from a runner that still has slice left, so it cannot turn into a
+	 * switch storm. pid 0 is the idle task, never a real victim.
+	 */
+	if (enq_flags & SCX_ENQ_WAKEUP) {
+		struct task_struct *victim =
+			__COMPAT_scx_bpf_cpu_curr(scx_bpf_task_cpu(p));
+
+		if (victim && victim != p && victim->pid != 0 &&
+		    victim->scx.slice == 0) {
+			enq_flags |= SCX_ENQ_PREEMPT;
+			__sync_fetch_and_add(&nr_expired_preempt, 1);
+		}
+	}
 
 	/*
 	 * Wakeup granularity gate: a waking task may preempt the current
