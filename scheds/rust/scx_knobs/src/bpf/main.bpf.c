@@ -83,6 +83,14 @@ static u64 vtime_now;
 UEI_DEFINE(uei);
 
 #define SHARED_DSQ 0
+/*
+ * Named-thread wakeups go here instead of SHARED_DSQ, and dispatch drains it
+ * first. SCX_ENQ_PREEMPT only pends the target rq -- when it finally
+ * reschedules, it picks whatever sits at the head of SHARED_DSQ by vtime,
+ * which is often not the task that asked to preempt. A separate DSQ makes
+ * the kick land on the named task instead of on some starved by-stander.
+ */
+#define PREEMPT_DSQ 1
 
 u64 nr_sleep_stop;      /* voluntary: blocked */
 u64 nr_slice_end_stop;  /* involuntary: slice exhausted */
@@ -212,14 +220,19 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Named-thread fast path: a waking task whose comm matches
 	 * preempt_comm takes the CPU right away, no matter how much vtime
-	 * credit it has banked. Everything else still goes through the
-	 * granularity gate below, so this only reorders the threads the user
-	 * explicitly named. The kick at the end of this function is what makes
-	 * it a real preemption rather than a request deferred to the next tick.
+	 * credit it has banked. It goes to PREEMPT_DSQ (drained before the
+	 * shared DSQ) so the kick below hands the CPU to *this* task rather
+	 * than to whoever happens to have the lowest vtime in SHARED_DSQ.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) && is_preempt_task(p)) {
 		enq_flags |= SCX_ENQ_PREEMPT;
 		__sync_fetch_and_add(&nr_named_preempt, 1);
+
+		note_assigned_slice(p, slice);
+		scx_bpf_dsq_insert(p, PREEMPT_DSQ, slice, enq_flags);
+		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
+		__sync_fetch_and_add(&nr_kick, 1);
+		return;
 	}
 
 	/*
@@ -257,6 +270,9 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(knobs_dispatch, s32 cpu, struct task_struct *prev)
 {
+	/* Preemption targets first, everyone else by vtime behind them. */
+	if (scx_bpf_dsq_move_to_local(PREEMPT_DSQ, 0))
+		return;
 	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 }
 
@@ -328,7 +344,10 @@ void BPF_STRUCT_OPS(knobs_enable, struct task_struct *p)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(knobs_init)
 {
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+	s32 ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (ret)
+		return ret;
+	return scx_bpf_create_dsq(PREEMPT_DSQ, -1);
 }
 
 void BPF_STRUCT_OPS(knobs_exit, struct scx_exit_info *ei)
