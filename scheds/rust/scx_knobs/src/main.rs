@@ -8,9 +8,11 @@
 //   --slice-ms   ~ sched_min_granularity_ns   (base slice, floor for period)
 //   --period-ms  ~ sched_latency_ns            (0 = static, >0 = period/n)
 //   --gran-us    ~ sched_wakeup_granularity_ns (wakeup preempt threshold)
+//   --preempt-comm NAME                        (threads with this comm prefix
+//                                               preempt on wakeup, gate bypassed)
 //
-// All three knobs are plain BSS variables, writable at runtime through
-// stdin commands (`slice MS`, `period MS`, `gran US`).
+// All knobs are plain BSS variables, writable at runtime through stdin
+// commands (`slice MS`, `period MS`, `gran US`, `pcomm NAME`).
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -72,6 +74,13 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     always_preempt: bool,
 
+    /// Name-based wakeup preemption: a waking task whose comm starts with
+    /// this string preempts the current runner immediately, ignoring
+    /// --gran-us. Prefix match, so "mock_io" covers mock_io0..3. Empty =
+    /// disabled. Runtime-tunable: `pcomm NAME` (bare `pcomm` clears it).
+    #[clap(long, default_value = "")]
+    preempt_comm: String,
+
     /// Partial takeover (SCX_OPS_SWITCH_PARTIAL): only tasks explicitly moved
     /// to the SCHED_EXT policy are scheduled by this BPF scheduler, everything
     /// else stays on CFS. Opt in with `chrt -E -a -p <pid>`. Note that the ext
@@ -95,6 +104,7 @@ enum Cmd {
     GranUs(u64),
     NoSwitch(bool),
     AlwaysPreempt(bool),
+    PreemptComm(String),
 }
 
 fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
@@ -130,6 +140,9 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     Some(&"off") => Some(Cmd::AlwaysPreempt(false)),
                     _ => None,
                 },
+                "pcomm" => Some(Cmd::PreemptComm(
+                    t.get(1).map(|s| s.to_string()).unwrap_or_default(),
+                )),
                 _ => None,
             };
             match cmd {
@@ -139,7 +152,7 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     }
                 }
                 None => eprintln!(
-                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off)"
+                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME)"
                     ),
             }
         }
@@ -152,6 +165,16 @@ fn ms_str(ms: u64, zero: &str) -> String {
         format!("{ms}ms")
     } else {
         zero.to_string()
+    }
+}
+
+/// Copy @name into a TASK_COMM_LEN BSS buffer: NUL-padded, truncated to
+/// TASK_COMM_LEN-1 bytes so the value always stays a valid C string.
+fn store_comm(dst: &mut [std::os::raw::c_char], name: &str) {
+    let max = dst.len().saturating_sub(1);
+    dst.fill(0);
+    for (d, s) in dst.iter_mut().zip(name.bytes().take(max)) {
+        *d = s as std::os::raw::c_char;
     }
 }
 
@@ -177,13 +200,20 @@ impl<'a> Scheduler<'a> {
             );
         }
         info!(
-            "knobs: slice={} period={} gran={}us preempt={}",
+            "knobs: slice={} period={} gran={}us preempt={} pcomm={}",
             ms_str(opts.slice_ms, "dfl"),
             ms_str(opts.period_ms, "off"),
             opts.gran_us,
-            if opts.always_preempt { "always" } else { "gated" }
+            if opts.always_preempt { "always" } else { "gated" },
+            if opts.preempt_comm.is_empty() {
+                "off"
+            } else {
+                opts.preempt_comm.as_str()
+            }
         );
-        info!("stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off");
+        info!(
+            "stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME"
+        );
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
@@ -208,6 +238,7 @@ impl<'a> Scheduler<'a> {
             bss.period_ns = opts.period_ms * MSEC;
             bss.wakeup_gran_ns = opts.gran_us * USEC;
             bss.always_preempt = u64::from(opts.always_preempt);
+            store_comm(&mut bss.preempt_comm, &opts.preempt_comm);
         }
 
         let mut skel = scx_ops_load!(skel, knobs_ops, uei)?;
@@ -235,6 +266,7 @@ impl<'a> Scheduler<'a> {
         let mut cur_gran_us = opts.gran_us;
         let mut cur_noswitch = false;
         let mut cur_preempt = opts.always_preempt;
+        let mut cur_pcomm = opts.preempt_comm.clone();
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(interval);
@@ -275,6 +307,14 @@ impl<'a> Scheduler<'a> {
                             if on { "ON (every wakeup preempts)" } else { "off" }
                         );
                     }
+                    Cmd::PreemptComm(name) => {
+                        store_comm(&mut bss.preempt_comm, &name);
+                        println!(
+                            "preempt_comm -> {}",
+                            if name.is_empty() { "off" } else { name.as_str() }
+                        );
+                        cur_pcomm = name;
+                    }
                 }
             }
 
@@ -285,7 +325,7 @@ impl<'a> Scheduler<'a> {
                 bss.nr_slice_end_stop,
                 bss.nr_preempt_stop,
                 bss.nr_wakeup_preempt,
-                bss.nr_expired_preempt,
+                bss.nr_named_preempt,
                 bss.nr_kick,
                 bss.nr_local_q,
                 bss.nr_global_q,
@@ -303,12 +343,13 @@ impl<'a> Scheduler<'a> {
             last = cur;
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} exp-pm={} kick={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={}",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
                 if cur_noswitch { "on" } else { "off" },
                 if cur_preempt { "always" } else { "gated" },
+                if cur_pcomm.is_empty() { "off" } else { cur_pcomm.as_str() },
                 d.0,
                 d.1,
                 d.2,

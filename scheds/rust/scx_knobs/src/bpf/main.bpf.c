@@ -39,6 +39,14 @@
  *                   "waiting for the slice to end". The kick sends the IPI
  *                   and switches right away.
  *
+ *   preempt_comm    Non-empty => a waking task whose comm starts with this
+ *                   string preempts the current runner immediately,
+ *                   regardless of its banked vtime credit (the granularity
+ *                   gate below is bypassed). Prefix match, so one value can
+ *                   cover a thread family ("mock_io" matches mock_io0..3).
+ *                   Empty => disabled. Like always_preempt this needs the
+ *                   explicit kick below to take effect before the next tick.
+ *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
  *                   until it blocks or yields -- zero involuntary
@@ -51,13 +59,16 @@
  * Switch attribution counters (userspace prints per-interval deltas):
  *   nr_sleep_stop / nr_slice_end_stop / nr_preempt_stop: voluntary vs
  *     involuntary split, aligned with /proc/<pid>/status semantics
- *   nr_wakeup_preempt: enqueues that carried SCX_ENQ_PREEMPT
- *   nr_expired_preempt: wakeups promoted to preemption because the runner on
- *     the target CPU had already used up its slice (timing fix, not budget)
+ *   nr_wakeup_preempt: enqueues that carried SCX_ENQ_PREEMPT via the credit gate
+ *   nr_named_preempt: wakeups by a preempt_comm-matching task (gate bypassed)
  *   nr_kick: explicit SCX_KICK_PREEMPT IPIs sent to force the switch now
  *   nr_local_q / nr_global_q: direct-dispatched vs shared-DSQ queued
  */
 #include <scx/common.bpf.h>
+
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 16
+#endif
 
 char _license[] SEC("license") = "GPL";
 
@@ -66,6 +77,7 @@ volatile u64 period_ns;      /* ~ sched_latency_ns, 0 => static slice mode */
 volatile u64 wakeup_gran_ns; /* ~ sched_wakeup_granularity_ns */
 volatile u64 always_preempt; /* 1 = every waking task preempts (gate bypassed) */
 volatile u64 no_switch;      /* 1 = run-to-completion: SCX_SLICE_INF, no preempt */
+volatile char preempt_comm[TASK_COMM_LEN]; /* comm prefix allowed to preempt on wakeup */
 
 static u64 vtime_now;
 UEI_DEFINE(uei);
@@ -75,8 +87,8 @@ UEI_DEFINE(uei);
 u64 nr_sleep_stop;      /* voluntary: blocked */
 u64 nr_slice_end_stop;  /* involuntary: slice exhausted */
 u64 nr_preempt_stop;    /* involuntary: preempted early (slice > 0 left) */
-u64 nr_wakeup_preempt;  /* enqueues that carried SCX_ENQ_PREEMPT */
-u64 nr_expired_preempt; /* wakeups that preempted an already-expired runner */
+u64 nr_wakeup_preempt;  /* enqueues that carried SCX_ENQ_PREEMPT via the gate */
+u64 nr_named_preempt;   /* wakeups by a preempt_comm-matching task */
 u64 nr_kick;            /* explicit SCX_KICK_PREEMPT IPIs */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on the shared DSQ */
@@ -118,6 +130,28 @@ static __always_inline void note_assigned_slice(struct task_struct *p, u64 slice
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 	if (tctx)
 		tctx->slice_assigned = slice;
+}
+
+/* Does @p's comm start with preempt_comm? Empty preempt_comm => never. */
+static __always_inline bool is_preempt_task(struct task_struct *p)
+{
+	char comm[TASK_COMM_LEN];
+	int i;
+
+	if (!preempt_comm[0])
+		return false;
+
+	__builtin_memset(comm, 0, sizeof(comm));
+	bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm);
+
+#pragma unroll
+	for (i = 0; i < TASK_COMM_LEN; i++) {
+		if (!preempt_comm[i])
+			return i != 0;
+		if (comm[i] != preempt_comm[i])
+			return false;
+	}
+	return true;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(knobs_init_task, struct task_struct *p,
@@ -176,23 +210,16 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 		vtime = vtime_now - slice;
 
 	/*
-	 * Expired-victim fast path. If the runner on @p's target CPU has
-	 * already burned its whole slice (scx.slice == 0), the kernel is going
-	 * to switch it out at this tick anyway; promote the wakeup to an
-	 * immediate preemption so the newcomer does not wait for the tick to
-	 * take effect. This is a pure timing fix -- it never steals budget
-	 * from a runner that still has slice left, so it cannot turn into a
-	 * switch storm. pid 0 is the idle task, never a real victim.
+	 * Named-thread fast path: a waking task whose comm matches
+	 * preempt_comm takes the CPU right away, no matter how much vtime
+	 * credit it has banked. Everything else still goes through the
+	 * granularity gate below, so this only reorders the threads the user
+	 * explicitly named. The kick at the end of this function is what makes
+	 * it a real preemption rather than a request deferred to the next tick.
 	 */
-	if (enq_flags & SCX_ENQ_WAKEUP) {
-		struct task_struct *victim =
-			__COMPAT_scx_bpf_cpu_curr(scx_bpf_task_cpu(p));
-
-		if (victim && victim != p && victim->pid != 0 &&
-		    victim->scx.slice == 0) {
-			enq_flags |= SCX_ENQ_PREEMPT;
-			__sync_fetch_and_add(&nr_expired_preempt, 1);
-		}
+	if ((enq_flags & SCX_ENQ_WAKEUP) && is_preempt_task(p)) {
+		enq_flags |= SCX_ENQ_PREEMPT;
+		__sync_fetch_and_add(&nr_named_preempt, 1);
 	}
 
 	/*
