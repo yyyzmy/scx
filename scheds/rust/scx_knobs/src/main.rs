@@ -170,12 +170,12 @@ fn ms_str(ms: u64, zero: &str) -> String {
 
 /// Copy @name into a TASK_COMM_LEN BSS buffer: NUL-padded, truncated to
 /// TASK_COMM_LEN-1 bytes so the value always stays a valid C string.
-/// libbpf-rs generates `char[N]` as `[u8; N]`.
-fn store_comm(dst: &mut [u8], name: &str) {
+/// Its type comes from the BPF BTF: `char[N]` -> `[i8; N]`.
+fn store_comm(dst: &mut [i8], name: &str) {
     let max = dst.len().saturating_sub(1);
     dst.fill(0);
     for (d, s) in dst.iter_mut().zip(name.bytes().take(max)) {
-        *d = s;
+        *d = s as i8;
     }
 }
 
