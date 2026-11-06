@@ -170,11 +170,12 @@ fn ms_str(ms: u64, zero: &str) -> String {
 
 /// Copy @name into a TASK_COMM_LEN BSS buffer: NUL-padded, truncated to
 /// TASK_COMM_LEN-1 bytes so the value always stays a valid C string.
-fn store_comm(dst: &mut [std::os::raw::c_char], name: &str) {
+/// libbpf-rs generates `char[N]` as `[u8; N]`.
+fn store_comm(dst: &mut [u8], name: &str) {
     let max = dst.len().saturating_sub(1);
     dst.fill(0);
     for (d, s) in dst.iter_mut().zip(name.bytes().take(max)) {
-        *d = s as std::os::raw::c_char;
+        *d = s;
     }
 }
 
