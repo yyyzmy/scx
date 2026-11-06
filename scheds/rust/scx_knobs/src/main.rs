@@ -10,9 +10,11 @@
 //   --gran-us    ~ sched_wakeup_granularity_ns (wakeup preempt threshold)
 //   --preempt-comm NAME                        (threads with this comm prefix
 //                                               preempt on wakeup, gate bypassed)
+//   --group-size N                             (keep unbound threads inside
+//                                               N-CPU placement groups, 0 = off)
 //
 // All knobs are plain BSS variables, writable at runtime through stdin
-// commands (`slice MS`, `period MS`, `gran US`, `pcomm NAME`).
+// commands (`slice MS`, `period MS`, `gran US`, `pcomm NAME`, `group N`).
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -81,6 +83,13 @@ struct Opts {
     #[clap(long, default_value = "")]
     preempt_comm: String,
 
+    /// Placement-group width in CPUs (default 8, 0 = disabled). A waking
+    /// task prefers an idle CPU in its own group; one group is learned per
+    /// process so all threads of a process stay together. Runtime-tunable:
+    /// `group N`.
+    #[clap(long, default_value_t = 8)]
+    group_size: u64,
+
     /// Partial takeover (SCX_OPS_SWITCH_PARTIAL): only tasks explicitly moved
     /// to the SCHED_EXT policy are scheduled by this BPF scheduler, everything
     /// else stays on CFS. Opt in with `chrt -E -a -p <pid>`. Note that the ext
@@ -105,6 +114,7 @@ enum Cmd {
     NoSwitch(bool),
     AlwaysPreempt(bool),
     PreemptComm(String),
+    GroupSize(u64),
 }
 
 fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
@@ -143,6 +153,10 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                 "pcomm" => Some(Cmd::PreemptComm(
                     t.get(1).map(|s| s.to_string()).unwrap_or_default(),
                 )),
+                "group" => t
+                    .get(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Cmd::GroupSize),
                 _ => None,
             };
             match cmd {
@@ -152,7 +166,7 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     }
                 }
                 None => eprintln!(
-                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME)"
+                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME | group N)"
                     ),
             }
         }
@@ -201,7 +215,7 @@ impl<'a> Scheduler<'a> {
             );
         }
         info!(
-            "knobs: slice={} period={} gran={}us preempt={} pcomm={}",
+            "knobs: slice={} period={} gran={}us preempt={} pcomm={} group={}",
             ms_str(opts.slice_ms, "dfl"),
             ms_str(opts.period_ms, "off"),
             opts.gran_us,
@@ -210,10 +224,15 @@ impl<'a> Scheduler<'a> {
                 "off"
             } else {
                 opts.preempt_comm.as_str()
+            },
+            if opts.group_size > 0 {
+                format!("{}cpus", opts.group_size)
+            } else {
+                "off".to_string()
             }
         );
         info!(
-            "stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME"
+            "stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME | group N"
         );
 
         let mut skel_builder = BpfSkelBuilder::default();
@@ -240,6 +259,7 @@ impl<'a> Scheduler<'a> {
             bss.wakeup_gran_ns = opts.gran_us * USEC;
             bss.always_preempt = u64::from(opts.always_preempt);
             store_comm(&mut bss.preempt_comm, &opts.preempt_comm);
+            bss.group_size = opts.group_size;
         }
 
         let mut skel = scx_ops_load!(skel, knobs_ops, uei)?;
@@ -268,6 +288,7 @@ impl<'a> Scheduler<'a> {
         let mut cur_noswitch = false;
         let mut cur_preempt = opts.always_preempt;
         let mut cur_pcomm = opts.preempt_comm.clone();
+        let mut cur_group = opts.group_size;
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(interval);
@@ -316,6 +337,18 @@ impl<'a> Scheduler<'a> {
                         );
                         cur_pcomm = name;
                     }
+                    Cmd::GroupSize(v) => {
+                        bss.group_size = v;
+                        cur_group = v;
+                        println!(
+                            "group_size -> {}",
+                            if v > 0 {
+                                format!("{v} cpus")
+                            } else {
+                                "off".to_string()
+                            }
+                        );
+                    }
                 }
             }
 
@@ -344,13 +377,14 @@ impl<'a> Scheduler<'a> {
             last = cur;
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} group={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={}",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
                 if cur_noswitch { "on" } else { "off" },
                 if cur_preempt { "always" } else { "gated" },
                 if cur_pcomm.is_empty() { "off" } else { cur_pcomm.as_str() },
+                cur_group,
                 d.0,
                 d.1,
                 d.2,

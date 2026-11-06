@@ -47,6 +47,13 @@
  *                   Empty => disabled. Like always_preempt this needs the
  *                   explicit kick below to take effect before the next tick.
  *
+ *   group_size      Placement-group width in CPUs (0 => disabled, default 8).
+ *                   A waking task prefers an idle CPU inside the group it
+ *                   last ran in, and one group is learned per process from
+ *                   its first thread so all threads of that process stay
+ *                   together. Only when nowhere in the group is idle does
+ *                   the task spill to the plain select_cpu_dfl placement.
+ *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
  *                   until it blocks or yields -- zero involuntary
@@ -78,6 +85,17 @@ volatile u64 wakeup_gran_ns; /* ~ sched_wakeup_granularity_ns */
 volatile u64 always_preempt; /* 1 = every waking task preempts (gate bypassed) */
 volatile u64 no_switch;      /* 1 = run-to-completion: SCX_SLICE_INF, no preempt */
 volatile char preempt_comm[TASK_COMM_LEN]; /* comm prefix allowed to preempt on wakeup */
+volatile u64 group_size;     /* CPUs per placement group, 0 => plain dfl placement */
+
+#define GROUP_MAX 64
+
+/* Preferred placement group per process, learned from its first thread. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, u32);	/* tgid */
+	__type(value, u32);	/* group id = cpu / group_size */
+	__uint(max_entries, 65536);
+} proc_group SEC(".maps");
 
 static u64 vtime_now;
 UEI_DEFINE(uei);
@@ -174,22 +192,91 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(knobs_init_task, struct task_struct *p,
 	return 0;
 }
 
+/* Effective group size: 0 => grouping disabled, otherwise clamped to 1..64. */
+static __always_inline u64 gsize(void)
+{
+	u64 g = group_size;
+
+	if (!g)
+		return 0;
+	return g > GROUP_MAX ? GROUP_MAX : g;
+}
+
+/* First idle CPU allowed for @p inside @grp, or -1 if the group is full. */
+static __always_inline s32 pick_idle_in_group(struct task_struct *p, u32 grp)
+{
+	u64 g = gsize();
+	s32 base = (s32)(grp * g);
+	int i;
+
+	bpf_for(i, 0, GROUP_MAX) {
+		s32 cpu;
+
+		if (i >= (int)g)
+			break;
+
+		cpu = base + i;
+		/* false for out-of-range CPUs too */
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		if (!scx_bpf_test_and_clear_cpu_idle(cpu))
+			continue;
+		return cpu;
+	}
+	return -1;
+}
+
+/* Hand @p to the CPU select_cpu returned, synchronously. */
+static __always_inline void dispatch_local(struct task_struct *p)
+{
+	u64 slice = eff_slice();
+
+	__sync_fetch_and_add(&nr_local_q, 1);
+	note_assigned_slice(p, slice);
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+}
+
 s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
 	bool is_idle = false;
-	s32 cpu;
+	s32 dfl, cpu;
+	u64 g = gsize();
+	u32 tgid, grp, *grpp;
 
-	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-	if (is_idle) {
-		u64 slice = eff_slice();
+	/*
+	 * Group stickiness (only when there is somewhere idle to go): keep a
+	 * task inside the group of @g CPUs it last ran in, and keep all threads
+	 * of one process inside the same group. The group is learned from the
+	 * first thread's CPU and remembered per tgid, so unbound threads
+	 * converge instead of scattering over the machine.
+	 */
+	if (g && prev_cpu >= 0) {
+		tgid = p->tgid;
+		grpp = bpf_map_lookup_elem(&proc_group, &tgid);
+		if (grpp) {
+			grp = *grpp;
+		} else {
+			grp = (u32)prev_cpu / (u32)g;
+			bpf_map_update_elem(&proc_group, &tgid, &grp, BPF_NOEXIST);
+		}
 
-		__sync_fetch_and_add(&nr_local_q, 1);
-		note_assigned_slice(p, slice);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+		/* dfl already gave us an idle CPU in the wanted group */
+		if (!(is_idle && dfl >= 0 && (u32)dfl / (u32)g == grp)) {
+			cpu = pick_idle_in_group(p, grp);
+			if (cpu >= 0) {
+				dispatch_local(p);
+				return cpu;
+			}
+		}
+		/* group full: spill to wherever dfl chose (enqueue decides) */
 	}
-	return cpu;
+
+	if (is_idle)
+		dispatch_local(p);
+	return dfl;
 }
 
 void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
