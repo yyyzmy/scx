@@ -83,10 +83,11 @@ struct Opts {
     #[clap(long, default_value = "")]
     preempt_comm: String,
 
-    /// Placement-group width in CPUs (default 8, 0 = disabled). A waking
-    /// task prefers an idle CPU in its own group; one group is learned per
-    /// process so all threads of a process stay together. Runtime-tunable:
-    /// `group N`.
+    /// Placement-group width in CPUs (default 8, 0 = disabled). Every group
+    /// gets its own DSQ that only its CPUs drain (a scheduling island), and
+    /// a waking task prefers an idle CPU in its own group; one group is
+    /// learned per process so all threads of a process stay together.
+    /// Runtime-tunable: `group N`.
     #[clap(long, default_value_t = 8)]
     group_size: u64,
 

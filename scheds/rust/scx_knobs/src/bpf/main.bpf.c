@@ -2,9 +2,11 @@
 /*
  * scx_knobs: the CFS tuning trio, rebuilt on sched_ext.
  *
- * Based on scx_simple's global weighted vtime scheduling: every task is
- * queued on one shared vtime-priority DSQ (weighted fair, sleeper bonus
- * capped at one slice); select_cpu() only direct-dispatches to an idle CPU.
+ * Based on scx_simple's global weighted vtime scheduling (weighted fair,
+ * sleeper bonus capped at one slice); select_cpu() only direct-dispatches to
+ * an idle CPU. With group_size set (the default), the global queue is split
+ * into one vtime DSQ per group_size-CPU island, each drained only by its own
+ * CPUs; group_size=0 keeps the single shared queue.
  *
  * Three runtime-tunable knobs (BSS, writable by userspace at any time):
  *
@@ -48,11 +50,16 @@
  *                   explicit kick below to take effect before the next tick.
  *
  *   group_size      Placement-group width in CPUs (0 => disabled, default 8).
- *                   A waking task prefers an idle CPU inside the group it
- *                   last ran in, and one group is learned per process from
- *                   its first thread so all threads of that process stay
- *                   together. Only when nowhere in the group is idle does
- *                   the task spill to the plain select_cpu_dfl placement.
+ *                   Every group owns a private DSQ and only the CPUs of that
+ *                   group drain it, so a queued task can only run inside its
+ *                   own group -- the group is a scheduling island with its
+ *                   own vtime queue, no cross-group lock contention. A waking
+ *                   task prefers an idle CPU inside the group it last ran in,
+ *                   and one group is learned per process from its first
+ *                   thread so all threads of that process stay together.
+ *                   Only when nowhere in the group is idle does the task
+ *                   spill to the plain select_cpu_dfl placement, and it is
+ *                   then queued in the group it spilled into.
  *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
@@ -88,6 +95,7 @@ volatile char preempt_comm[TASK_COMM_LEN]; /* comm prefix allowed to preempt on 
 volatile u64 group_size;     /* CPUs per placement group, 0 => plain dfl placement */
 
 #define GROUP_MAX 64
+#define GROUPS_MAX 128		/* group DSQs created at init (1024 CPUs @ 8) */
 
 /* Preferred placement group per process, learned from its first thread. */
 struct {
@@ -102,13 +110,56 @@ UEI_DEFINE(uei);
 
 #define SHARED_DSQ 0
 /*
- * Named-thread wakeups go here instead of SHARED_DSQ, and dispatch drains it
- * first. SCX_ENQ_PREEMPT only pends the target rq -- when it finally
- * reschedules, it picks whatever sits at the head of SHARED_DSQ by vtime,
- * which is often not the task that asked to preempt. A separate DSQ makes
- * the kick land on the named task instead of on some starved by-stander.
+ * Named-thread wakeups go here instead of the per-group DSQ, and dispatch
+ * drains it first. SCX_ENQ_PREEMPT only pends the target rq -- when it
+ * finally reschedules, it picks whatever sits at the head of its queue by
+ * vtime, which is often not the task that asked to preempt. A separate DSQ
+ * that every CPU drains makes the kick land on the named task instead of on
+ * some starved by-stander.
  */
 #define PREEMPT_DSQ 1
+
+/*
+ * One DSQ per group_size-CPU island: group g owns GROUP_DSQ_BASE + g and
+ * only the CPUs of group g pull from it. Tasks are queued in the group of
+ * the CPU the kernel assigned them to, so a wakeup/requeue never waits for
+ * CPUs that are not in its group -- and groups stop sharing a queue lock.
+ * Groups past what init created (small group_size on a huge machine) fall
+ * back to SHARED_DSQ, as does grouping-off mode.
+ */
+#define GROUP_DSQ_BASE 2
+
+static u32 nr_group_dsqs;	/* group DSQs actually created, <= GROUPS_MAX */
+static u32 nr_possible_cpus;	/* nr_cpu_ids, cached by knobs_init */
+
+static __always_inline u64 group_dsq(u32 grp)
+{
+	return (u64)GROUP_DSQ_BASE + grp;
+}
+
+/* Queue that group @grp pulls from; SHARED_DSQ when that group has none. */
+static __always_inline u64 queue_of(u32 grp)
+{
+	return grp < nr_group_dsqs ? group_dsq(grp) : (u64)SHARED_DSQ;
+}
+
+/* Effective group size: 0 => grouping disabled, otherwise clamped to 1..64. */
+static __always_inline u64 gsize(void)
+{
+	u64 g = group_size;
+
+	if (!g)
+		return 0;
+	return g > GROUP_MAX ? GROUP_MAX : g;
+}
+
+/* Number of groups that actually own CPUs under the current group_size. */
+static __always_inline u32 nr_groups(void)
+{
+	u64 g = gsize();
+
+	return (u32)((nr_possible_cpus + (u32)g - 1) / (u32)g);
+}
 
 u64 nr_sleep_stop;      /* voluntary: blocked */
 u64 nr_slice_end_stop;  /* involuntary: slice exhausted */
@@ -117,7 +168,7 @@ u64 nr_wakeup_preempt;  /* enqueues that carried SCX_ENQ_PREEMPT via the gate */
 u64 nr_named_preempt;   /* wakeups by a preempt_comm-matching task */
 u64 nr_kick;            /* explicit SCX_KICK_PREEMPT IPIs */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
-u64 nr_global_q;        /* queued on the shared DSQ */
+u64 nr_global_q;        /* queued on a DSQ (group queue or shared) */
 
 /* exact vtime charging needs the slice actually assigned to the task */
 struct task_ctx {
@@ -131,7 +182,12 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
-static __always_inline u64 eff_slice(void)
+/*
+ * Slice for a task about to sit on @dsq: period mode divides the period by
+ * the depth of the queue the task is actually queued on, which is now the
+ * group queue instead of one global queue.
+ */
+static __always_inline u64 eff_slice_dsq(u64 dsq)
 {
 	u64 slice = slice_ns ? slice_ns : SCX_SLICE_DFL;
 
@@ -139,7 +195,7 @@ static __always_inline u64 eff_slice(void)
 		return SCX_SLICE_INF;
 
 	if (period_ns) {
-		u64 nr = scx_bpf_dsq_nr_queued(SHARED_DSQ) + 1;
+		u64 nr = scx_bpf_dsq_nr_queued(dsq) + 1;
 		u64 dyn_slice = period_ns / nr;
 
 		if (dyn_slice < slice)		/* min-granularity floor */
@@ -192,16 +248,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(knobs_init_task, struct task_struct *p,
 	return 0;
 }
 
-/* Effective group size: 0 => grouping disabled, otherwise clamped to 1..64. */
-static __always_inline u64 gsize(void)
-{
-	u64 g = group_size;
-
-	if (!g)
-		return 0;
-	return g > GROUP_MAX ? GROUP_MAX : g;
-}
-
 /* First idle CPU allowed for @p inside @grp, or -1 if the group is full. */
 static __always_inline s32 pick_idle_in_group(struct task_struct *p, u32 grp)
 {
@@ -226,10 +272,28 @@ static __always_inline s32 pick_idle_in_group(struct task_struct *p, u32 grp)
 	return -1;
 }
 
-/* Hand @p to the CPU select_cpu returned, synchronously. */
-static __always_inline void dispatch_local(struct task_struct *p)
+/*
+ * Group remembered for @p's process, learned from @cpu the first time the
+ * process is seen so all of its unbound threads converge on one group.
+ */
+static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 {
-	u64 slice = eff_slice();
+	u32 tgid = p->tgid;
+	u32 grp, *grpp;
+
+	grpp = bpf_map_lookup_elem(&proc_group, &tgid);
+	if (grpp)
+		return *grpp;
+
+	grp = (u32)cpu / (u32)gsize();
+	bpf_map_update_elem(&proc_group, &tgid, &grp, BPF_NOEXIST);
+	return grp;
+}
+
+/* Hand @p to the CPU select_cpu returned, synchronously. */
+static __always_inline void dispatch_local(struct task_struct *p, u64 dsq)
+{
+	u64 slice = eff_slice_dsq(dsq);
 
 	__sync_fetch_and_add(&nr_local_q, 1);
 	note_assigned_slice(p, slice);
@@ -242,7 +306,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bool is_idle = false;
 	s32 dfl, cpu;
 	u64 g = gsize();
-	u32 tgid, grp, *grpp;
+	u32 grp;
 
 	dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
@@ -254,37 +318,42 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * converge instead of scattering over the machine.
 	 */
 	if (g && prev_cpu >= 0) {
-		tgid = p->tgid;
-		grpp = bpf_map_lookup_elem(&proc_group, &tgid);
-		if (grpp) {
-			grp = *grpp;
-		} else {
-			grp = (u32)prev_cpu / (u32)g;
-			bpf_map_update_elem(&proc_group, &tgid, &grp, BPF_NOEXIST);
-		}
+		grp = proc_group_of(p, prev_cpu);
 
 		/* dfl already gave us an idle CPU in the wanted group */
 		if (!(is_idle && dfl >= 0 && (u32)dfl / (u32)g == grp)) {
 			cpu = pick_idle_in_group(p, grp);
 			if (cpu >= 0) {
-				dispatch_local(p);
+				dispatch_local(p, queue_of(grp));
 				return cpu;
 			}
 		}
-		/* group full: spill to wherever dfl chose (enqueue decides) */
+		/* group full: spill to wherever dfl chose; enqueue then queues
+		 * the task on the group it landed in */
 	}
 
 	if (is_idle)
-		dispatch_local(p);
+		dispatch_local(p, g ? queue_of((u32)dfl / (u32)g) : SHARED_DSQ);
 	return dfl;
 }
 
 void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	u64 slice = eff_slice();
-	u64 vtime = p->scx.dsq_vtime;
+	u64 g = gsize();
+	u64 dsq = SHARED_DSQ;
+	u64 slice, vtime = p->scx.dsq_vtime;
 	u64 credit;
 
+	/*
+	 * Queue the task on the island holding its CPU: only that group's CPUs
+	 * pull from it, so it can never be woken onto a group that does not
+	 * have it, and each group gets its own DSQ lock instead of every CPU
+	 * hammering one global queue.
+	 */
+	if (g)
+		dsq = queue_of((u32)scx_bpf_task_cpu(p) / (u32)g);
+
+	slice = eff_slice_dsq(dsq);
 	__sync_fetch_and_add(&nr_global_q, 1);
 
 	if (no_switch) {
@@ -296,7 +365,7 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 		 * that would underflow with SCX_SLICE_INF.
 		 */
 		note_assigned_slice(p, slice);
-		scx_bpf_dsq_insert(p, SHARED_DSQ, slice, enq_flags);
+		scx_bpf_dsq_insert(p, dsq, slice, enq_flags);
 		return;
 	}
 
@@ -307,9 +376,9 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Named-thread fast path: a waking task whose comm matches
 	 * preempt_comm takes the CPU right away, no matter how much vtime
-	 * credit it has banked. It goes to PREEMPT_DSQ (drained before the
-	 * shared DSQ) so the kick below hands the CPU to *this* task rather
-	 * than to whoever happens to have the lowest vtime in SHARED_DSQ.
+	 * credit it has banked. It goes to PREEMPT_DSQ (drained first by every
+	 * CPU) so the kick below hands the CPU to *this* task rather than to
+	 * whoever happens to have the lowest vtime in the target queue.
 	 */
 	if ((enq_flags & SCX_ENQ_WAKEUP) && is_preempt_task(p)) {
 		enq_flags |= SCX_ENQ_PREEMPT;
@@ -337,16 +406,16 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	note_assigned_slice(p, slice);
-	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, dsq, slice, vtime, enq_flags);
 
 	/*
-	 * A shared-DSQ insert only pends the target rq for resched. A task
+	 * A DSQ insert only pends the target rq for resched. A task
 	 * spinning in userspace does not check TIF_NEED_RESCHED until its
 	 * next tick, so the "preemption" would land at the next tick or slice
 	 * boundary -- i.e. it would look exactly like no preemption at all.
 	 * Kick the target CPU to send the resched IPI and switch right now.
 	 * The kick must come *after* the insert: the target CPU dispatches
-	 * from SHARED_DSQ as soon as it handles the IPI, and must find the
+	 * from the DSQ as soon as it handles the IPI, and must find the
 	 * task already queued.
 	 */
 	if (enq_flags & SCX_ENQ_PREEMPT) {
@@ -355,11 +424,54 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 }
 
+/*
+ * Leftover queues with no CPU under the current group_size: raising the knob
+ * at runtime merges groups and strands the higher-indexed queues, whose tasks
+ * no CPU would ever pull again. Let any CPU drain them so those tasks run once
+ * more and then requeue into a live queue. Costs one comparison when there is
+ * nothing stranded, which is the normal case.
+ */
+static __always_inline bool drain_orphans(void)
+{
+	u32 live = nr_groups();
+	u32 q;
+
+	if (live >= nr_group_dsqs)
+		return false;
+
+	bpf_for(q, 0, GROUPS_MAX) {
+		if (q >= nr_group_dsqs)
+			break;
+		if (q < live)
+			continue;
+		if (scx_bpf_dsq_move_to_local(group_dsq(q), 0))
+			return true;
+	}
+	return false;
+}
+
 void BPF_STRUCT_OPS(knobs_dispatch, s32 cpu, struct task_struct *prev)
 {
-	/* Preemption targets first, everyone else by vtime behind them. */
+	u64 g = gsize();
+
+	/* Preemption targets first, they must never wait behind a queue. */
 	if (scx_bpf_dsq_move_to_local(PREEMPT_DSQ, 0))
 		return;
+
+	/*
+	 * Then the island's own queue. A CPU only ever pulls its own group's
+	 * tasks, which is what pins the group to these CPUs. If that queue is
+	 * empty, fall back to the shared queue (grouping-off mode, tasks whose
+	 * group has no DSQ, and overflow from ineligible groups).
+	 */
+	if (g) {
+		u64 dsq = queue_of((u32)cpu / (u32)g);
+
+		if (dsq != SHARED_DSQ && scx_bpf_dsq_move_to_local(dsq, 0))
+			return;
+		if (drain_orphans())
+			return;
+	}
 	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 }
 
@@ -431,10 +543,36 @@ void BPF_STRUCT_OPS(knobs_enable, struct task_struct *p)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(knobs_init)
 {
-	s32 ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	u32 nr_cpus = scx_bpf_nr_cpu_ids();
+	u32 want = nr_cpus < GROUPS_MAX ? nr_cpus : GROUPS_MAX;
+	s32 ret, i;
+
+	nr_possible_cpus = nr_cpus;
+
+	ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
 	if (ret)
 		return ret;
-	return scx_bpf_create_dsq(PREEMPT_DSQ, -1);
+
+	ret = scx_bpf_create_dsq(PREEMPT_DSQ, -1);
+	if (ret)
+		return ret;
+
+	/*
+	 * One DSQ per CPU here; runtime group_size then decides how many of
+	 * them are actually used (nr_cpu_ids / group_size islands). Creating
+	 * one per CPU caps small group_size on big machines without needing to
+	 * know the knob's final value at load time -- groups past the created
+	 * ones simply fall back to SHARED_DSQ.
+	 */
+	bpf_for(i, 0, GROUPS_MAX) {
+		if (i >= (s32)want)
+			break;
+		ret = scx_bpf_create_dsq(group_dsq(i), -1);
+		if (ret)
+			return ret;
+		nr_group_dsqs = i + 1;
+	}
+	return 0;
 }
 
 void BPF_STRUCT_OPS(knobs_exit, struct scx_exit_info *ei)
