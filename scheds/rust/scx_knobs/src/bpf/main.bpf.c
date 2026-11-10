@@ -57,9 +57,10 @@
  *                   task prefers an idle CPU inside the group it last ran in,
  *                   and one group is learned per process from its first
  *                   thread so all threads of that process stay together.
- *                   Only when nowhere in the group is idle does the task
- *                   spill to the plain select_cpu_dfl placement, and it is
- *                   then queued in the group it spilled into.
+ *                   There is no spillover: when the home group is full the
+ *                   task waits in the group's DSQ (isolation over throughput).
+ *                   Only a task whose affinity excludes its whole home group
+ *                   falls back to the plain select_cpu_dfl placement.
  *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
@@ -273,6 +274,33 @@ static __always_inline s32 pick_idle_in_group(struct task_struct *p, u32 grp)
 }
 
 /*
+ * Any CPU allowed for @p inside @grp, busy or idle. Used to pin a task to
+ * its home group when no CPU there is idle: select_cpu returns it so that
+ * enqueue queues the task on the group's own DSQ, where only the group's
+ * CPUs can pick it up. -1 when the affinity mask has no overlap with the
+ * group at all, in which case the caller must fall back to dfl placement
+ * (a task that cannot run anywhere in its group cannot be held there).
+ */
+static __always_inline s32 any_cpu_in_group(struct task_struct *p, u32 grp)
+{
+	u64 g = gsize();
+	s32 base = (s32)(grp * g);
+	int i;
+
+	bpf_for(i, 0, GROUP_MAX) {
+		s32 cpu;
+
+		if (i >= (int)g)
+			break;
+
+		cpu = base + i;
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			return cpu;
+	}
+	return -1;
+}
+
+/*
  * Group remembered for @p's process, learned from @cpu the first time the
  * process is seen so all of its unbound threads converge on one group.
  */
@@ -311,11 +339,14 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
 	/*
-	 * Group stickiness (only when there is somewhere idle to go): keep a
-	 * task inside the group of @g CPUs it last ran in, and keep all threads
-	 * of one process inside the same group. The group is learned from the
-	 * first thread's CPU and remembered per tgid, so unbound threads
-	 * converge instead of scattering over the machine.
+	 * Group stickiness (hard isolation): keep a task inside the group of
+	 * @g CPUs it last ran in, and keep all threads of one process inside
+	 * the same group. The group is learned from the first thread's CPU and
+	 * remembered per tgid, so unbound threads converge instead of
+	 * scattering over the machine. There is no spillover: when the home
+	 * group is full the task is pinned to a group CPU anyway and waits in
+	 * the group's own DSQ, so a group behaves as a fixed little machine of
+	 * its own and load never leaks across groups.
 	 */
 	if (g && prev_cpu >= 0) {
 		grp = proc_group_of(p, prev_cpu);
@@ -327,9 +358,25 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 				dispatch_local(p, queue_of(grp));
 				return cpu;
 			}
+
+			/*
+			 * Home group full: stay. Return a CPU inside the group
+			 * so enqueue queues the task on the group's DSQ -- it
+			 * waits for one of the group's CPUs instead of spilling
+			 * to whatever idle CPU the rest of the machine has.
+			 * prev_cpu if it is already home (cache-warm), else the
+			 * first CPU of the group the affinity allows.
+			 */
+			if ((u32)prev_cpu / (u32)g == grp)
+				return prev_cpu;
+			cpu = any_cpu_in_group(p, grp);
+			if (cpu >= 0)
+				return cpu;
+			/*
+			 * Affinity excludes the whole home group: the task
+			 * cannot be held there, fall back to dfl placement.
+			 */
 		}
-		/* group full: spill to wherever dfl chose; enqueue then queues
-		 * the task on the group it landed in */
 	}
 
 	if (is_idle)
