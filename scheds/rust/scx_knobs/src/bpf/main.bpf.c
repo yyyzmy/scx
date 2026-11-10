@@ -249,12 +249,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(knobs_init_task, struct task_struct *p,
 	return 0;
 }
 
-/* First idle CPU allowed for @p inside @grp, or -1 if the group is full. */
-static __always_inline s32 pick_idle_in_group(struct task_struct *p, u32 grp)
+/*
+ * Idle CPU allowed for @p inside @grp, or -1 if the group is full.
+ * @prev_cpu is tried first: cache-warm, and without it every wake scans
+ * from the group head and all threads herd onto the group's low CPUs
+ * (the first idle one wins), leaving the tail of the group unused.
+ */
+static __always_inline s32 pick_idle_in_group(struct task_struct *p, s32 prev_cpu,
+					       u32 grp)
 {
 	u64 g = gsize();
 	s32 base = (s32)(grp * g);
 	int i;
+
+	if (prev_cpu >= 0 && (u32)prev_cpu / (u32)g == grp &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		return prev_cpu;
 
 	bpf_for(i, 0, GROUP_MAX) {
 		s32 cpu;
@@ -353,7 +364,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 		/* dfl already gave us an idle CPU in the wanted group */
 		if (!(is_idle && dfl >= 0 && (u32)dfl / (u32)g == grp)) {
-			cpu = pick_idle_in_group(p, grp);
+			cpu = pick_idle_in_group(p, prev_cpu, grp);
 			if (cpu >= 0) {
 				dispatch_local(p, queue_of(grp));
 				return cpu;
