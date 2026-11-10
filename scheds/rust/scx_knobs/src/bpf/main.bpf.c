@@ -467,6 +467,27 @@ void BPF_STRUCT_OPS(knobs_enqueue, struct task_struct *p, u64 enq_flags)
 	scx_bpf_dsq_insert_vtime(p, dsq, slice, vtime, enq_flags);
 
 	/*
+	 * Wake an idle group CPU to come collect. Idle CPUs do not poll the
+	 * group DSQ: a CPU that went idle before this task was queued sleeps
+	 * until something kicks it, so the task can only be picked up by one
+	 * of the group's *busy* CPUs at their next dispatch point -- queued
+	 * tasks herd between the busy CPUs while the idle ones sleep right
+	 * through it. This matters most for SCX_ENQ_REENQ (slice-expiry
+	 * re-enqueue), which never goes through select_cpu and thus never
+	 * gets a chance at the idle CPUs. The picker's test_and_clear claims
+	 * the CPU atomically, so concurrent enqueues wake different CPUs.
+	 */
+	if (g) {
+		s32 idle = pick_idle_in_group(p, scx_bpf_task_cpu(p),
+					      (u32)scx_bpf_task_cpu(p) / (u32)g);
+
+		if (idle >= 0) {
+			scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
+			__sync_fetch_and_add(&nr_kick, 1);
+		}
+	}
+
+	/*
 	 * A DSQ insert only pends the target rq for resched. A task
 	 * spinning in userspace does not check TIF_NEED_RESCHED until its
 	 * next tick, so the "preemption" would land at the next tick or slice
