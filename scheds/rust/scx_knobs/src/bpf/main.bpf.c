@@ -381,6 +381,8 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * the group's own DSQ, so a group behaves as a fixed little machine of
 	 * its own and load never leaks across groups.
 	 */
+	 bpf_printk("knobs_selectcpu: pid=%d(%s) prev=%d affinity=%s",
+				   p->pid, p->comm, prev_cpu, p->cpus_ptr);
 	if (g && prev_cpu >= 0) {
 		grp = proc_group_of(p, prev_cpu);
 
