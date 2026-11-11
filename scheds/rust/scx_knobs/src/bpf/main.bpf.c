@@ -361,9 +361,33 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 		return *homep / (u32)gsize();
 	}
 
+	/*
+	 * Learn only from a CPU the task may actually run on. The first
+	 * wakeup's prev_cpu can be outside the affinity mask (a taskset'd
+	 * child forked by an unbound shell inherits the shell's fork CPU
+	 * as prev_cpu), which used to pin the whole process to a group it
+	 * can never run on: every later wakeup then burned a full
+	 * no-affinity scan over CPUs it cannot use before falling back to
+	 * dfl. Fall back to the first affinity-allowed CPU instead.
+	 */
 	home = (u32)cpu;
-	bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d g=%llu grp=%u",
-		   p->pid, p->comm, tgid, cpu, gsize(),
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+		s32 i, ok = -1;
+
+		bpf_for(i, 0, 1024) {		/* NR_CPUS hard bound */
+			if (i >= (s32)scx_bpf_nr_cpu_ids())
+				break;
+			if (bpf_cpumask_test_cpu(i, p->cpus_ptr)) {
+				ok = i;
+				break;
+			}
+		}
+		if (ok >= 0)
+			home = (u32)ok;
+	}
+
+	bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d home=%u g=%llu grp=%u",
+		   p->pid, p->comm, tgid, cpu, home, gsize(),
 		   home / (u32)gsize());
 	bpf_map_update_elem(&proc_group, &tgid, &home, BPF_NOEXIST);
 	return home / (u32)gsize();
@@ -432,9 +456,62 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 				return cpu;
 			}
 			/*
-			 * Affinity excludes the whole home group: the task
-			 * cannot be held there, fall back to dfl placement.
+			 * Affinity excludes the whole home group (e.g. the
+			 * task was re-taskset'ed to another group's CPUs):
+			 * the old home is unreachable, every wakeup would burn
+			 * a full no-affinity scan before falling back to dfl.
+			 * Re-learn the home from the first CPU the affinity
+			 * still allows, so the whole process converges on the
+			 * new range instead. prev_cpu cannot be used here --
+			 * it may be the fork CPU of an unbound shell, which
+			 * is exactly how the unreachable home was learned in
+			 * the first place.
 			 */
+			if (prev_cpu >= 0) {
+				s32 i, ok = -1;
+
+				bpf_for(i, 0, 1024) {		/* NR_CPUS hard bound */
+					if (i >= (s32)scx_bpf_nr_cpu_ids())
+						break;
+					if (bpf_cpumask_test_cpu(i, p->cpus_ptr)) {
+						ok = i;
+						break;
+					}
+				}
+				if (ok >= 0) {
+					u32 tgid = p->tgid;
+					u32 newhome = (u32)ok;
+
+					bpf_map_update_elem(&proc_group, &tgid,
+							    &newhome, BPF_ANY);
+					bpf_printk("knobs: pid=%d(%s) home-RELEARN tgid=%d old_grp=%u new_home=%u grp=%u",
+						   p->pid, p->comm, tgid, grp,
+						   newhome, newhome / (u32)g);
+					/*
+					 * Pick an idle CPU in the new group
+					 * right away; fall through to the
+					 * normal full-group path when the
+					 * new group is busy too, so the task
+					 * still never lands on a CPU the
+					 * affinity forbids.
+					 */
+					cpu = pick_idle_in_group(p, prev_cpu,
+								 newhome / (u32)g);
+					if (cpu >= 0) {
+						dispatch_local(p,
+							queue_of(newhome / (u32)g));
+						return cpu;
+					}
+					if ((u32)prev_cpu / (u32)g == newhome / (u32)g) {
+						bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d (relearned)",
+							   p->pid, p->comm, prev_cpu);
+						return prev_cpu;
+					}
+					bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d (relearned)",
+						   p->pid, p->comm, ok);
+					return ok;
+				}
+			}
 			bpf_printk("knobs: pid=%d(%s) affinity-excludes-home dfl=%d",
 				   p->pid, p->comm, dfl);
 		} else {
