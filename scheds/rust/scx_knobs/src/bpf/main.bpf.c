@@ -98,11 +98,19 @@ volatile u64 group_size;     /* CPUs per placement group, 0 => plain dfl placeme
 #define GROUP_MAX 64
 #define GROUPS_MAX 128		/* group DSQs created at init (1024 CPUs @ 8) */
 
-/* Preferred placement group per process, learned from its first thread. */
+/*
+ * Preferred placement group per process, learned from its first thread.
+ * The value stores a representative *home CPU*, not a group index: a
+ * group index silently re-means something else every time group_size is
+ * changed at runtime (e.g. an index learned under g=4 from CPU 76 maps to
+ * nonexistent CPUs 152-159 once g=8), pinning the whole process to a group
+ * it can never run on. Storing the CPU and dividing by the *current* gsize
+ * on every lookup re-derives a group that always contains a real CPU.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__type(key, u32);	/* tgid */
-	__type(value, u32);	/* group id = cpu / group_size */
+	__type(value, u32);	/* home cpu (divided by current gsize on read) */
 	__uint(max_entries, 65536);
 } proc_group SEC(".maps");
 
@@ -336,19 +344,29 @@ static __always_inline s32 any_cpu_in_group(struct task_struct *p, u32 grp)
 /*
  * Group remembered for @p's process, learned from @cpu the first time the
  * process is seen so all of its unbound threads converge on one group.
+ * The map stores @cpu itself; the group is re-derived with the *current*
+ * gsize on every call so runtime group_size changes re-interpret it
+ * sanely instead of mapping to a different (possibly empty) CPU range.
  */
 static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 {
 	u32 tgid = p->tgid;
-	u32 grp, *grpp;
+	u32 home, *homep;
 
-	grpp = bpf_map_lookup_elem(&proc_group, &tgid);
-	if (grpp)
-		return *grpp;
+	homep = bpf_map_lookup_elem(&proc_group, &tgid);
+	if (homep) {
+		bpf_printk("knobs: pid=%d(%s) grp-lookup tgid=%d home_cpu=%d g=%llu grp=%u",
+			   p->pid, p->comm, tgid, *homep, gsize(),
+			   *homep / (u32)gsize());
+		return *homep / (u32)gsize();
+	}
 
-	grp = (u32)cpu / (u32)gsize();
-	bpf_map_update_elem(&proc_group, &tgid, &grp, BPF_NOEXIST);
-	return grp;
+	home = (u32)cpu;
+	bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d g=%llu grp=%u",
+		   p->pid, p->comm, tgid, cpu, gsize(),
+		   home / (u32)gsize());
+	bpf_map_update_elem(&proc_group, &tgid, &home, BPF_NOEXIST);
+	return home / (u32)gsize();
 }
 
 /* Hand @p to the CPU select_cpu returned, synchronously. */
