@@ -262,10 +262,22 @@ static __always_inline s32 pick_idle_in_group(struct task_struct *p, s32 prev_cp
 	s32 base = (s32)(grp * g);
 	int i;
 
-	if (prev_cpu >= 0 && (u32)prev_cpu / (u32)g == grp &&
-	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-		return prev_cpu;
+	if (prev_cpu >= 0 && (u32)prev_cpu / (u32)g == grp) {
+		if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+			bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d affinity-no",
+				   p->pid, p->comm, grp, prev_cpu);
+		} else if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d IDLE->TAKE",
+				   p->pid, p->comm, grp, prev_cpu);
+			return prev_cpu;
+		} else {
+			bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d busy",
+				   p->pid, p->comm, grp, prev_cpu);
+		}
+	} else if (prev_cpu >= 0) {
+		bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d prev-not-in-grp",
+			   p->pid, p->comm, grp, prev_cpu);
+	}
 
 	bpf_for(i, 0, GROUP_MAX) {
 		s32 cpu;
@@ -275,12 +287,22 @@ static __always_inline s32 pick_idle_in_group(struct task_struct *p, s32 prev_cp
 
 		cpu = base + i;
 		/* false for out-of-range CPUs too */
-		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			bpf_printk("knobs: pid=%d(%s) scan grp=%u cpu=%d no-affinity",
+				   p->pid, p->comm, grp, cpu);
 			continue;
-		if (!scx_bpf_test_and_clear_cpu_idle(cpu))
+		}
+		if (!scx_bpf_test_and_clear_cpu_idle(cpu)) {
+			bpf_printk("knobs: pid=%d(%s) scan grp=%u cpu=%d busy",
+				   p->pid, p->comm, grp, cpu);
 			continue;
+		}
+		bpf_printk("knobs: pid=%d(%s) scan grp=%u cpu=%d IDLE->TAKE",
+			   p->pid, p->comm, grp, cpu);
 		return cpu;
 	}
+	bpf_printk("knobs: pid=%d(%s) grp=%u group-full (-1)",
+		   p->pid, p->comm, grp);
 	return -1;
 }
 
@@ -378,15 +400,26 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 			 * prev_cpu if it is already home (cache-warm), else the
 			 * first CPU of the group the affinity allows.
 			 */
-			if ((u32)prev_cpu / (u32)g == grp)
+			if ((u32)prev_cpu / (u32)g == grp) {
+				bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d",
+					   p->pid, p->comm, prev_cpu);
 				return prev_cpu;
+			}
 			cpu = any_cpu_in_group(p, grp);
-			if (cpu >= 0)
+			if (cpu >= 0) {
+				bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d",
+					   p->pid, p->comm, cpu);
 				return cpu;
+			}
 			/*
 			 * Affinity excludes the whole home group: the task
 			 * cannot be held there, fall back to dfl placement.
 			 */
+			bpf_printk("knobs: pid=%d(%s) affinity-excludes-home dfl=%d",
+				   p->pid, p->comm, dfl);
+		} else {
+			bpf_printk("knobs: pid=%d(%s) select dfl-in-grp dfl=%d",
+				   p->pid, p->comm, dfl);
 		}
 	}
 
