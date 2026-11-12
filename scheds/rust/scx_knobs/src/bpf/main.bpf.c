@@ -411,8 +411,6 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	u64 g = gsize();
 	u32 grp;
 
-	dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-
 	/*
 	 * Group stickiness (hard isolation): keep a task inside the group of
 	 * @g CPUs it last ran in, and keep all threads of one process inside
@@ -422,106 +420,134 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * group is full the task is pinned to a group CPU anyway and waits in
 	 * the group's own DSQ, so a group behaves as a fixed little machine of
 	 * its own and load never leaks across groups.
+	 *
+	 * Order matters: prev_cpu is probed alone *first*, so the common
+	 * cache-warm hit never lets dfl claim (and possibly waste) an idle
+	 * bit. dfl only runs when prev is busy, and its topology-aware pick is
+	 * accepted only when it lands inside the home group; anything else it
+	 * claims gets discarded, so the last resort is our own group scan.
 	 */
-	 bpf_printk("knobs_selectcpu: pid=%d(%s) prev=%d affinity=%s",
-				   p->pid, p->comm, prev_cpu, p->cpus_ptr);
 	if (g && prev_cpu >= 0) {
 		grp = proc_group_of(p, prev_cpu);
 
-		/* dfl already gave us an idle CPU in the wanted group */
-		if (!(is_idle && dfl >= 0 && (u32)dfl / (u32)g == grp)) {
-			cpu = pick_idle_in_group(p, prev_cpu, grp);
-			if (cpu >= 0) {
-				dispatch_local(p, queue_of(grp));
-				return cpu;
-			}
+		/* 1. prev_cpu alone: cache-warm, no dfl claim when it hits */
+		if ((u32)prev_cpu / (u32)g == grp &&
+		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			bpf_printk("knobs: pid=%d(%s) prev-first grp=%u prev=%d IDLE->TAKE",
+				   p->pid, p->comm, grp, prev_cpu);
+			dispatch_local(p, queue_of(grp));
+			return prev_cpu;
+		}
 
-			/*
-			 * Home group full: stay. Return a CPU inside the group
-			 * so enqueue queues the task on the group's DSQ -- it
-			 * waits for one of the group's CPUs instead of spilling
-			 * to whatever idle CPU the rest of the machine has.
-			 * prev_cpu if it is already home (cache-warm), else the
-			 * first CPU of the group the affinity allows.
-			 */
-			if ((u32)prev_cpu / (u32)g == grp) {
-				bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d",
-					   p->pid, p->comm, prev_cpu);
-				return prev_cpu;
-			}
-			cpu = any_cpu_in_group(p, grp);
-			if (cpu >= 0) {
-				bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d",
-					   p->pid, p->comm, cpu);
-				return cpu;
-			}
-			/*
-			 * Affinity excludes the whole home group (e.g. the
-			 * task was re-taskset'ed to another group's CPUs):
-			 * the old home is unreachable, every wakeup would burn
-			 * a full no-affinity scan before falling back to dfl.
-			 * Re-learn the home from the first CPU the affinity
-			 * still allows, so the whole process converges on the
-			 * new range instead. prev_cpu cannot be used here --
-			 * it may be the fork CPU of an unbound shell, which
-			 * is exactly how the unreachable home was learned in
-			 * the first place.
-			 */
-			if (prev_cpu >= 0) {
-				s32 i, ok = -1;
-
-				bpf_for(i, 0, 1024) {		/* NR_CPUS hard bound */
-					if (i >= (s32)scx_bpf_nr_cpu_ids())
-						break;
-					if (bpf_cpumask_test_cpu(i, p->cpus_ptr)) {
-						ok = i;
-						break;
-					}
-				}
-				if (ok >= 0) {
-					u32 tgid = p->tgid;
-					u32 newhome = (u32)ok;
-
-					bpf_map_update_elem(&proc_group, &tgid,
-							    &newhome, BPF_ANY);
-					bpf_printk("knobs: pid=%d(%s) home-RELEARN tgid=%d old_grp=%u new_home=%u grp=%u",
-						   p->pid, p->comm, tgid, grp,
-						   newhome, newhome / (u32)g);
-					/*
-					 * Pick an idle CPU in the new group
-					 * right away; fall through to the
-					 * normal full-group path when the
-					 * new group is busy too, so the task
-					 * still never lands on a CPU the
-					 * affinity forbids.
-					 */
-					cpu = pick_idle_in_group(p, prev_cpu,
-								 newhome / (u32)g);
-					if (cpu >= 0) {
-						dispatch_local(p,
-							queue_of(newhome / (u32)g));
-						return cpu;
-					}
-					if ((u32)prev_cpu / (u32)g == newhome / (u32)g) {
-						bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d (relearned)",
-							   p->pid, p->comm, prev_cpu);
-						return prev_cpu;
-					}
-					bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d (relearned)",
-						   p->pid, p->comm, ok);
-					return ok;
-				}
-			}
-			bpf_printk("knobs: pid=%d(%s) affinity-excludes-home dfl=%d",
-				   p->pid, p->comm, dfl);
-		} else {
+		/* 2. dfl: topology-aware, accepted only inside the group */
+		dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+		if (is_idle && dfl >= 0 && (u32)dfl / (u32)g == grp) {
 			bpf_printk("knobs: pid=%d(%s) select dfl-in-grp dfl=%d",
 				   p->pid, p->comm, dfl);
+			dispatch_local(p, queue_of(grp));
+			return dfl;
 		}
+
+		/* 3. our own group scan (prev fast path re-prints busy) */
+		cpu = pick_idle_in_group(p, prev_cpu, grp);
+		if (cpu >= 0) {
+			dispatch_local(p, queue_of(grp));
+			return cpu;
+		}
+
+		/*
+		 * Home group full: stay. Return a CPU inside the group
+		 * so enqueue queues the task on the group's DSQ -- it
+		 * waits for one of the group's CPUs instead of spilling
+		 * to whatever idle CPU the rest of the machine has.
+		 * prev_cpu if it is already home (cache-warm), else the
+		 * first CPU of the group the affinity allows.
+		 */
+		if ((u32)prev_cpu / (u32)g == grp) {
+			bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d",
+				   p->pid, p->comm, prev_cpu);
+			return prev_cpu;
+		}
+		cpu = any_cpu_in_group(p, grp);
+		if (cpu >= 0) {
+			bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d",
+				   p->pid, p->comm, cpu);
+			return cpu;
+		}
+		/*
+		 * Affinity excludes the whole home group (e.g. the
+		 * task was re-taskset'ed to another group's CPUs):
+		 * the old home is unreachable, every wakeup would burn
+		 * a full no-affinity scan before falling back to dfl.
+		 * Re-learn the home from the first CPU the affinity
+		 * still allows, so the whole process converges on the
+		 * new range instead. prev_cpu cannot be used here --
+		 * it may be the fork CPU of an unbound shell, which
+		 * is exactly how the unreachable home was learned in
+		 * the first place.
+		 */
+		if (prev_cpu >= 0) {
+			s32 i, ok = -1;
+
+			bpf_for(i, 0, 1024) {		/* NR_CPUS hard bound */
+				if (i >= (s32)scx_bpf_nr_cpu_ids())
+					break;
+				if (bpf_cpumask_test_cpu(i, p->cpus_ptr)) {
+					ok = i;
+					break;
+				}
+			}
+			if (ok >= 0) {
+				u32 tgid = p->tgid;
+				u32 newhome = (u32)ok;
+
+				bpf_map_update_elem(&proc_group, &tgid,
+						    &newhome, BPF_ANY);
+				bpf_printk("knobs: pid=%d(%s) home-RELEARN tgid=%d old_grp=%u new_home=%u grp=%u",
+					   p->pid, p->comm, tgid, grp,
+					   newhome, newhome / (u32)g);
+				/*
+				 * Pick an idle CPU in the new group
+				 * right away; fall through to the
+				 * normal full-group path when the
+				 * new group is busy too, so the task
+				 * still never lands on a CPU the
+				 * affinity forbids.
+				 */
+				cpu = pick_idle_in_group(p, prev_cpu,
+							 newhome / (u32)g);
+				if (cpu >= 0) {
+					dispatch_local(p,
+						queue_of(newhome / (u32)g));
+					return cpu;
+				}
+				if ((u32)prev_cpu / (u32)g == newhome / (u32)g) {
+					bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d (relearned)",
+						   p->pid, p->comm, prev_cpu);
+					return prev_cpu;
+				}
+				bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d (relearned)",
+					   p->pid, p->comm, ok);
+				return ok;
+			}
+		}
+		/*
+		 * affinity-excludes-home and relearn both failed (mask
+		 * empty?): fall back to plain dfl placement, computed in
+		 * step 2 above.
+		 */
+		bpf_printk("knobs: pid=%d(%s) affinity-excludes-home dfl=%d",
+			   p->pid, p->comm, dfl);
+		if (is_idle)
+			dispatch_local(p, queue_of((u32)dfl / (u32)g));
+		return dfl;
 	}
 
+	/* grouping off or no prev_cpu: plain dfl placement */
+	dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle)
-		dispatch_local(p, g ? queue_of((u32)dfl / (u32)g) : SHARED_DSQ);
+		dispatch_local(p, SHARED_DSQ);
 	return dfl;
 }
 
