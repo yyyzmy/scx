@@ -442,23 +442,28 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 			if (pg < ng && pg < nr_group_dsqs && pg < GROUPS_MAX) {
 				seed_grp = (s64)pg;
 				best_grp = seed_grp;
-				best_load = group_load[pg];
+				best_load = group_load[pg & (GROUPS_MAX - 1)];
 			}
 		}
 
 		/*
-		 * pass 2: lightest feasible group; 64-bit grp end to end
-		 * (see ops.running) so the array index stays bounded
+		 * pass 2: lightest feasible group. The & (GROUPS_MAX-1)
+		 * mask re-establishes a full-register bound even where the
+		 * 32-bit division above lost verifier precision: the AND is
+		 * 64-bit, so the array index gets var_off=(0, 0x7f) no
+		 * matter what the compare alone could prove.
 		 */
 		for (grp = 0; grp < GROUPS_MAX; grp++) {
 			bool feas;
+			u32 load;
 
 			if (grp >= ng || grp >= nr_group_dsqs)
 				break;		/* no candidate groups beyond */
 			feas = grp < 64 ? (feas_lo & (1ULL << grp)) != 0 :
 					  (feas_hi & (1ULL << (grp - 64))) != 0;
-			if (feas && group_load[grp] < best_load) {
-				best_load = group_load[grp];
+			load = group_load[grp & (GROUPS_MAX - 1)];
+			if (feas && load < best_load) {
+				best_load = load;
 				best_grp = (s64)grp;
 			}
 		}
@@ -497,8 +502,16 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 	}
 
 	{
-		u64 hgrp = (u64)home / gsize();		/* 64-bit, see above */
-		u32 hload = hgrp < GROUPS_MAX ? group_load[hgrp] : 0;
+		/*
+		 * index masked (see pass 2): the compiler narrows the
+		 * division to 32-bit ops, which lose verifier precision;
+		 * the mask restores a full-register bound for the access
+		 */
+		u64 hgrp = (u64)home / gsize();
+		u32 hload = 0;
+
+		if (hgrp < GROUPS_MAX)
+			hload = group_load[hgrp & (GROUPS_MAX - 1)];
 
 		bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d home=%u g=%llu grp=%llu load=%u",
 			   p->pid, p->comm, tgid, cpu, home, gsize(), hgrp, hload);
