@@ -756,11 +756,18 @@ void BPF_STRUCT_OPS(knobs_running, struct task_struct *p)
 	/*
 	 * Busy-CPUs-per-group counter. Pairs with the dec in ops.stopping;
 	 * task_cpu is the CPU the task is starting on, so this tracks
-	 * running tasks per group. GROUPS_MAX is the compile-time bound the
-	 * verifier needs for the array access.
+	 * running tasks per group.
+	 *
+	 * grp is computed and bounds-checked in full 64-bit registers on
+	 * purpose: with 32-bit arithmetic the subreg division + compare
+	 * bound only the low half of the register, and the array index
+	 * scaling (a 64-bit shift) then sees unbounded upper bits --
+	 * "math between map_value pointer and register with unbounded
+	 * min value". Staying 64-bit end to end lets the branch bound the
+	 * whole register before the scaled array access.
 	 */
 	if (g) {
-		u32 grp = (u32)scx_bpf_task_cpu(p) / (u32)g;
+		u64 grp = (u64)scx_bpf_task_cpu(p) / g;
 
 		if (grp < GROUPS_MAX)
 			__sync_fetch_and_add(&group_load[grp], 1);
@@ -780,9 +787,12 @@ void BPF_STRUCT_OPS(knobs_stopping, struct task_struct *p, bool runnable)
 	u64 g = gsize();
 	u64 assigned;
 
-	/* pairs with the inc in ops.running */
+	/*
+	 * pairs with the inc in ops.running; 64-bit grp for the verifier
+	 * (see the comment there)
+	 */
 	if (g) {
-		u32 grp = (u32)scx_bpf_task_cpu(p) / (u32)g;
+		u64 grp = (u64)scx_bpf_task_cpu(p) / g;
 
 		/*
 		 * Guard against underflow: a task already running when the
