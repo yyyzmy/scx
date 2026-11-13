@@ -437,9 +437,18 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 		}
 
 		if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			/*
+			 * No compile-time bound in this guard, on purpose
+			 * (see the printk below): ng / nr_group_dsqs are
+			 * runtime globals the compiler cannot reason about,
+			 * so the & (GROUPS_MAX-1) mask on the array read
+			 * cannot be folded away and keeps the index
+			 * verifier-bounded. Correctness comes from the init
+			 * invariant nr_group_dsqs <= GROUPS_MAX.
+			 */
 			u64 pg = (u64)(u32)cpu / g;
 
-			if (pg < ng && pg < nr_group_dsqs && pg < GROUPS_MAX) {
+			if (pg < ng && pg < nr_group_dsqs) {
 				seed_grp = (s64)pg;
 				best_grp = seed_grp;
 				best_load = group_load[pg & (GROUPS_MAX - 1)];
@@ -503,15 +512,17 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 
 	{
 		/*
-		 * index masked (see pass 2): the compiler narrows the
-		 * division to 32-bit ops, which lose verifier precision;
-		 * the mask restores a full-register bound for the access
+		 * Unguarded mask, deliberately: a `hgrp < GROUPS_MAX` guard
+		 * lets the compiler fold the mask away as redundant (it
+		 * proved the bound), and the division -- narrowed to 32-bit
+		 * ops because home is a u32 -- already left the register
+		 * unbounded to the verifier. With no constant bound in
+		 * sight the mask survives, and the 32-bit AND bounds the
+		 * full register. A wrapped index only mislabels this debug
+		 * print, it cannot go out of bounds.
 		 */
 		u64 hgrp = (u64)home / gsize();
-		u32 hload = 0;
-
-		if (hgrp < GROUPS_MAX)
-			hload = group_load[hgrp & (GROUPS_MAX - 1)];
+		u32 hload = group_load[(u32)hgrp & (GROUPS_MAX - 1)];
 
 		bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d home=%u g=%llu grp=%llu load=%u",
 			   p->pid, p->comm, tgid, cpu, home, gsize(), hgrp, hload);
