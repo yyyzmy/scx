@@ -377,19 +377,114 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 	}
 
 	/*
-	 * Learn only from a CPU the task may actually run on. The first
-	 * wakeup's prev_cpu can be outside the affinity mask (a taskset'd
+	 * Learn in the group with the fewest busy CPUs (group_load[], O(1)
+	 * reads maintained by ops.running/stopping) *among the groups the
+	 * affinity mask can actually run in*, so processes forked in a
+	 * burst do not all pile into one group. prev_cpu's group is the
+	 * seeded tie winner (switching needs strictly more idleness), so a
+	 * uniformly idle machine learns exactly where prev ran, as before.
+	 *
+	 * Two passes, for the verifier: pass 1 is a single plain bounded
+	 * loop over CPUs building a 128-bit feasible-group bitmap, at most
+	 * one cpumask kfunc per trip -- the same shape as the RELEARN loop
+	 * that verifies fine; a kfunc inside a per-group loop is what blew
+	 * the complexity limit in earlier attempts. Pass 2 scans groups
+	 * touching only that bitmap and group_load[] -- zero kfuncs.
+	 */
+	home = (u32)cpu;
+	{
+		u64 g = gsize();
+		u32 ng = nr_groups();
+		u32 best_load = 0xffffffffU;
+		s64 best_grp = -1;
+		s64 seed_grp = -1;
+		u64 feas_lo = 0, feas_hi = 0;
+		u32 scan_end, nr_cpus;
+		u64 grp;
+		int i;
+
+		/* pass 1: feasible-group bitmap (>= 1 allowed CPU each) */
+		scan_end = ng * (u32)g;		/* CPUs owned by candidate groups */
+		nr_cpus = (u32)scx_bpf_nr_cpu_ids();
+		if (scan_end > nr_cpus)
+			scan_end = nr_cpus;
+		for (i = 0; i < 1024; i++) {		/* NR_CPUS hard bound */
+			u64 grp_i;
+
+			if (i >= (s32)scan_end)
+				break;
+			grp_i = (u64)i / g;
+			if (grp_i >= GROUPS_MAX)
+				break;
+			/*
+			 * one test per group: once a group's bit is set the
+			 * rest of its CPUs cost nothing (common case: the
+			 * mask is wide, the group's first CPU already matches)
+			 */
+			if (grp_i < 64) {
+				if (feas_lo & (1ULL << grp_i))
+					continue;
+			} else {
+				if (feas_hi & (1ULL << (grp_i - 64)))
+					continue;
+			}
+			if (bpf_cpumask_test_cpu(i, p->cpus_ptr)) {
+				if (grp_i < 64)
+					feas_lo |= 1ULL << grp_i;
+				else
+					feas_hi |= 1ULL << (grp_i - 64);
+			}
+		}
+
+		if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			u64 pg = (u64)(u32)cpu / g;
+
+			if (pg < ng && pg < nr_group_dsqs && pg < GROUPS_MAX) {
+				seed_grp = (s64)pg;
+				best_grp = seed_grp;
+				best_load = group_load[pg];
+			}
+		}
+
+		/*
+		 * pass 2: lightest feasible group; 64-bit grp end to end
+		 * (see ops.running) so the array index stays bounded
+		 */
+		for (grp = 0; grp < GROUPS_MAX; grp++) {
+			bool feas;
+
+			if (grp >= ng || grp >= nr_group_dsqs)
+				break;		/* no candidate groups beyond */
+			feas = grp < 64 ? (feas_lo & (1ULL << grp)) != 0 :
+					  (feas_hi & (1ULL << (grp - 64))) != 0;
+			if (feas && group_load[grp] < best_load) {
+				best_load = group_load[grp];
+				best_grp = (s64)grp;
+			}
+		}
+
+		if (best_grp >= 0 && best_grp != seed_grp) {
+			s32 c = any_cpu_in_group(p, (u32)best_grp);
+
+			if (c >= 0)
+				home = (u32)c;
+			/* winner is always feasible here; guard for safety */
+		}
+		/* best_grp == seed_grp: home stays prev_cpu, cache-warm */
+	}
+
+	/*
+	 * prev_cpu can still be outside the affinity mask (a taskset'd
 	 * child forked by an unbound shell inherits the shell's fork CPU
 	 * as prev_cpu), which used to pin the whole process to a group it
 	 * can never run on: every later wakeup then burned a full
-	 * no-affinity scan over CPUs it cannot use before falling back to
-	 * dfl. Fall back to the first affinity-allowed CPU instead.
+	 * no-affinity scan before falling back to dfl. Fall back to the
+	 * first affinity-allowed CPU instead.
 	 */
-	home = (u32)cpu;
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+	if (!bpf_cpumask_test_cpu((s32)home, p->cpus_ptr)) {
 		s32 i, ok = -1;
 
-		bpf_for(i, 0, 1024) {		/* NR_CPUS hard bound */
+		for (i = 0; i < 1024; i++) {		/* NR_CPUS hard bound */
 			if (i >= (s32)scx_bpf_nr_cpu_ids())
 				break;
 			if (bpf_cpumask_test_cpu(i, p->cpus_ptr)) {
@@ -401,9 +496,13 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 			home = (u32)ok;
 	}
 
-	bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d home=%u g=%llu grp=%u",
-		   p->pid, p->comm, tgid, cpu, home, gsize(),
-		   home / (u32)gsize());
+	{
+		u64 hgrp = (u64)home / gsize();		/* 64-bit, see above */
+		u32 hload = hgrp < GROUPS_MAX ? group_load[hgrp] : 0;
+
+		bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d home=%u g=%llu grp=%llu load=%u",
+			   p->pid, p->comm, tgid, cpu, home, gsize(), hgrp, hload);
+	}
 	bpf_map_update_elem(&proc_group, &tgid, &home, BPF_NOEXIST);
 	return home / (u32)gsize();
 }
