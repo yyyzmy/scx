@@ -341,6 +341,9 @@ impl<'a> Scheduler<'a> {
                     Cmd::GroupSize(v) => {
                         bss.group_size = v;
                         cur_group = v;
+                        // Busy-CPU counts keyed under the old group width
+                        // are meaningless; restart them fresh.
+                        bss.group_load.fill(0);
                         println!(
                             "group_size -> {}",
                             if v > 0 {
@@ -377,8 +380,18 @@ impl<'a> Scheduler<'a> {
             );
             last = cur;
 
+            // Per-group busy-CPU snapshot: only non-zero groups, so an
+            // idle machine prints nothing extra.
+            let gloads: Vec<String> = bss
+                .group_load
+                .iter()
+                .enumerate()
+                .filter(|(_, &n)| n > 0)
+                .map(|(g, &n)| format!("{g}:{n}"))
+                .collect();
+
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} group={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={}",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} group={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={} | gload: [{}]",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
@@ -394,6 +407,7 @@ impl<'a> Scheduler<'a> {
                 d.5,
                 d.6,
                 d.7,
+                gloads.join(" "),
             );
         }
 

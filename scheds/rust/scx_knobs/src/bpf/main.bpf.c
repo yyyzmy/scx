@@ -140,6 +140,21 @@ UEI_DEFINE(uei);
 
 static u32 nr_group_dsqs;	/* group DSQs actually created, <= GROUPS_MAX */
 static u32 nr_possible_cpus;	/* nr_cpu_ids, cached by knobs_init */
+/*
+ * Running tasks per group == busy CPUs in group g, maintained incrementally
+ * by ops.running(+1) / ops.stopping(-1). Nothing consumes it yet -- this is
+ * the load signal for placement decisions, added first so it can be watched
+ * (userspace reads it live from the skeleton bss) before any policy starts
+ * using it.
+ *
+ * NOT static on purpose: the skeleton's bss struct is generated from BTF and
+ * only carries global-linkage variables (see slice_ns / the nr_* counters
+ * for the pattern); static ones (vtime_now, nr_group_dsqs) are invisible to
+ * userspace. Userspace zeroes this array on a group_size change -- entries
+ * keyed under an old group width are meaningless (and the running/stopping
+ * pair would otherwise drift on width changes).
+ */
+u32 group_load[GROUPS_MAX];
 
 static __always_inline u64 group_dsq(u32 grp)
 {
@@ -736,6 +751,21 @@ void BPF_STRUCT_OPS(knobs_tick, struct task_struct *p)
 
 void BPF_STRUCT_OPS(knobs_running, struct task_struct *p)
 {
+	u64 g = gsize();
+
+	/*
+	 * Busy-CPUs-per-group counter. Pairs with the dec in ops.stopping;
+	 * task_cpu is the CPU the task is starting on, so this tracks
+	 * running tasks per group. GROUPS_MAX is the compile-time bound the
+	 * verifier needs for the array access.
+	 */
+	if (g) {
+		u32 grp = (u32)scx_bpf_task_cpu(p) / (u32)g;
+
+		if (grp < GROUPS_MAX)
+			__sync_fetch_and_add(&group_load[grp], 1);
+	}
+
 	/*
 	 * Global vtime progresses as tasks start executing. Racy on multiple
 	 * CPUs; any error is contained and temporary (scx_simple semantics).
@@ -747,7 +777,24 @@ void BPF_STRUCT_OPS(knobs_running, struct task_struct *p)
 void BPF_STRUCT_OPS(knobs_stopping, struct task_struct *p, bool runnable)
 {
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+	u64 g = gsize();
 	u64 assigned;
+
+	/* pairs with the inc in ops.running */
+	if (g) {
+		u32 grp = (u32)scx_bpf_task_cpu(p) / (u32)g;
+
+		/*
+		 * Guard against underflow: a task already running when the
+		 * scheduler attaches (or when the array is zeroed on a
+		 * group_size change) stops without a matching running. A
+		 * missed dec leaves the count slightly high (harmless for a
+		 * load heuristic); wrapping to 2^32-1 would make the group
+		 * look permanently full.
+		 */
+		if (grp < GROUPS_MAX && group_load[grp])
+			__sync_fetch_and_add(&group_load[grp], -1);
+	}
 
 	/* switch attribution (global) */
 	if (!runnable) {
