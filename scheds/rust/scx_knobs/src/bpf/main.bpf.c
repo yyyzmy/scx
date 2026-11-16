@@ -62,6 +62,20 @@
  *                   Only a task whose affinity excludes its whole home group
  *                   falls back to the plain select_cpu_dfl placement.
  *
+ *   balance         1 (userspace default) => lazy group load balancing. When
+ *                   a task's home group is full (no idle CPU it may use),
+ *                   the whole process moves to the lightest group the task's
+ *                   affinity mask allows, provided that group is lighter
+ *                   than home by more than one task (load = busy CPUs +
+ *                   queued tasks, the margin damps ping-pong) and an idle
+ *                   CPU there is actually taken -- the home rewrite is
+ *                   committed only after the task really lands in the new
+ *                   group. This fires only at the pressure point (home
+ *                   full, task would queue anyway), so it costs nothing on
+ *                   an unpressured machine. 0 => strict isolation: the task
+ *                   queues inside its full home group and never spills
+ *                   (isolation over throughput).
+ *
  *   no_switch       1 => run-to-completion experiment: SCX_SLICE_INF and
  *                   wakeup preemption never armed. A task keeps its CPU
  *                   until it blocks or yields -- zero involuntary
@@ -78,6 +92,7 @@
  *   nr_named_preempt: wakeups by a preempt_comm-matching task (gate bypassed)
  *   nr_kick: explicit SCX_KICK_PREEMPT IPIs sent to force the switch now
  *   nr_local_q / nr_global_q: direct-dispatched vs shared-DSQ queued
+ *   nr_lb_migrate: home-full balance moves (process home group rewrites)
  */
 #include <scx/common.bpf.h>
 
@@ -94,6 +109,7 @@ volatile u64 always_preempt; /* 1 = every waking task preempts (gate bypassed) *
 volatile u64 no_switch;      /* 1 = run-to-completion: SCX_SLICE_INF, no preempt */
 volatile char preempt_comm[TASK_COMM_LEN]; /* comm prefix allowed to preempt on wakeup */
 volatile u64 group_size;     /* CPUs per placement group, 0 => plain dfl placement */
+volatile u64 balance;        /* 1 = home-full lazy group load balancing */
 
 #define GROUP_MAX 64
 #define GROUPS_MAX 128		/* group DSQs created at init (1024 CPUs @ 8) */
@@ -193,6 +209,7 @@ u64 nr_named_preempt;   /* wakeups by a preempt_comm-matching task */
 u64 nr_kick;            /* explicit SCX_KICK_PREEMPT IPIs */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on a DSQ (group queue or shared) */
+u64 nr_lb_migrate;      /* home-full balance: process home moved to lighter grp */
 
 /* exact vtime charging needs the slice actually assigned to the task */
 struct task_ctx {
@@ -408,6 +425,73 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 	return home / (u32)gsize();
 }
 
+/*
+ * Lightest placement group @p could run in, for lazy load balancing.
+ *
+ * "Feasible" = the group contains at least one CPU allowed by @p's affinity
+ * mask; only feasible groups are candidates, so the pick can never strand
+ * the task outside its mask. Group load = busy CPUs (group_load, maintained
+ * by ops.running/stopping) + tasks queued on the group's DSQ, so a group
+ * with a deep queue loses to one with spare capacity even at equal busy
+ * counts.
+ *
+ * Two single-layer bpf_for passes (nested iterators explode the verifier):
+ * pass 1 marks the feasible set in a 128-bit bitmap, pass 2 picks the
+ * lightest marked group. The bitmap index is computed in full 64-bit and
+ * masked with the compile-time constant (GROUPS_MAX - 1) after the division
+ * -- see ops.running for why the mask must survive the compiler.
+ *
+ * Returns the group to migrate to, or -1 when moving does not pay: no
+ * feasible group other than home, or home is not heavier than the lightest
+ * feasible group by at least one task (the anti-ping-pong margin).
+ */
+static __always_inline s32 pick_balance_group(struct task_struct *p, u32 home_grp)
+{
+	u64 g = gsize();
+	u64 feasible[2] = {};
+	u64 min_load = ~0ULL, home_load = ~0ULL;
+	s32 best = -1;
+	int cpu, grp;
+
+	/* pass 1: mark every group holding >= 1 affinity-allowed CPU */
+	bpf_for(cpu, 0, 1024) {			/* NR_CPUS hard bound */
+		u64 q;
+
+		if (cpu >= (s32)scx_bpf_nr_cpu_ids())
+			break;
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		q = (u64)cpu / g;
+		q &= (GROUPS_MAX - 1);
+		feasible[q >> 6] |= 1ULL << (q & 63);
+	}
+
+	/* pass 2: lightest of the feasible set */
+	bpf_for(grp, 0, GROUPS_MAX) {
+		u64 load;
+
+		if (!(feasible[grp >> 6] & (1ULL << (grp & 63))))
+			continue;
+		load = group_load[grp] + scx_bpf_dsq_nr_queued(queue_of(grp));
+		if (load < min_load) {
+			min_load = load;
+			best = (s32)grp;
+		}
+	}
+
+	if (best < 0 || (u32)best == home_grp)
+		return -1;
+
+	/* home must be heavier by more than the margin (one task) */
+	if (home_grp < GROUPS_MAX)
+		home_load = group_load[home_grp] +
+			    scx_bpf_dsq_nr_queued(queue_of(home_grp));
+	if (min_load >= home_load)
+		return -1;
+
+	return best;
+}
+
 /* Hand @p to the CPU select_cpu returned, synchronously. */
 static __always_inline void dispatch_local(struct task_struct *p, u64 dsq)
 {
@@ -469,6 +553,38 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		if (cpu >= 0) {
 			dispatch_local(p, queue_of(grp));
 			return cpu;
+		}
+
+		/*
+		 * 4. home-full lazy load balance: the home group is full and
+		 * the task would queue behind its CPUs anyway -- the one
+		 * moment migration costs nothing (the task is off-CPU, nobody
+		 * gets preempted). Move the process to the lightest feasible
+		 * group when it is lighter than home by more than the margin.
+		 * The home rewrite (which moves the whole process, keeping its
+		 * threads together) is committed only after an idle CPU in
+		 * the new group is actually taken, so a lost race leaves the
+		 * placement completely untouched.
+		 */
+		if (balance) {
+			s32 bal = pick_balance_group(p, grp);
+
+			if (bal >= 0) {
+				cpu = pick_idle_in_group(p, prev_cpu, (u32)bal);
+				if (cpu >= 0) {
+					u32 tgid = p->tgid;
+					u32 newhome = (u32)cpu;
+
+					bpf_map_update_elem(&proc_group, &tgid,
+							    &newhome, BPF_ANY);
+					__sync_fetch_and_add(&nr_lb_migrate, 1);
+					bpf_printk("knobs: pid=%d(%s) LB-MIGRATE tgid=%d grp=%u->%u cpu=%d",
+						   p->pid, p->comm, tgid, grp,
+						   (u32)bal, cpu);
+					dispatch_local(p, queue_of((u32)bal));
+					return cpu;
+				}
+			}
 		}
 
 		/*

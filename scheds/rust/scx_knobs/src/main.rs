@@ -12,9 +12,13 @@
 //                                               preempt on wakeup, gate bypassed)
 //   --group-size N                             (keep unbound threads inside
 //                                               N-CPU placement groups, 0 = off)
+//   --no-balance                               (disable lazy group load
+//                                               balancing; with it, a full home
+//                                               group never spills its tasks)
 //
 // All knobs are plain BSS variables, writable at runtime through stdin
-// commands (`slice MS`, `period MS`, `gran US`, `pcomm NAME`, `group N`).
+// commands (`slice MS`, `period MS`, `gran US`, `pcomm NAME`, `group N`,
+// `balance on|off`).
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -91,6 +95,14 @@ struct Opts {
     #[clap(long, default_value_t = 8)]
     group_size: u64,
 
+    /// Disable lazy group load balancing (default: on). When a task's home
+    /// group is full, the process moves to the lightest group its CPU
+    /// affinity allows instead of queueing behind the full group.
+    /// --no-balance restores strict isolation (never leave a full home).
+    /// Runtime-tunable: `balance on|off`.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    no_balance: bool,
+
     /// Partial takeover (SCX_OPS_SWITCH_PARTIAL): only tasks explicitly moved
     /// to the SCHED_EXT policy are scheduled by this BPF scheduler, everything
     /// else stays on CFS. Opt in with `chrt -E -a -p <pid>`. Note that the ext
@@ -116,6 +128,7 @@ enum Cmd {
     AlwaysPreempt(bool),
     PreemptComm(String),
     GroupSize(u64),
+    Balance(bool),
 }
 
 fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
@@ -158,6 +171,11 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     .get(1)
                     .and_then(|s| s.parse::<u64>().ok())
                     .map(Cmd::GroupSize),
+                "balance" => match t.get(1) {
+                    Some(&"on") => Some(Cmd::Balance(true)),
+                    Some(&"off") => Some(Cmd::Balance(false)),
+                    _ => None,
+                },
                 _ => None,
             };
             match cmd {
@@ -167,8 +185,8 @@ fn spawn_stdin_thread() -> mpsc::Receiver<Cmd> {
                     }
                 }
                 None => eprintln!(
-                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME | group N)"
-                    ),
+                        "unknown command: {line}  (try: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME | group N | balance on|off)"
+                ),
             }
         }
     });
@@ -216,7 +234,7 @@ impl<'a> Scheduler<'a> {
             );
         }
         info!(
-            "knobs: slice={} period={} gran={}us preempt={} pcomm={} group={}",
+            "knobs: slice={} period={} gran={}us preempt={} pcomm={} group={} balance={}",
             ms_str(opts.slice_ms, "dfl"),
             ms_str(opts.period_ms, "off"),
             opts.gran_us,
@@ -230,10 +248,11 @@ impl<'a> Scheduler<'a> {
                 format!("{}cpus", opts.group_size)
             } else {
                 "off".to_string()
-            }
+            },
+            if opts.no_balance { "off" } else { "on" },
         );
         info!(
-            "stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME | group N"
+            "stdin commands: slice MS | period MS | gran US | noswitch on|off | preempt on|off | pcomm NAME | group N | balance on|off"
         );
 
         let mut skel_builder = BpfSkelBuilder::default();
@@ -261,6 +280,7 @@ impl<'a> Scheduler<'a> {
             bss.always_preempt = u64::from(opts.always_preempt);
             store_comm(&mut bss.preempt_comm, &opts.preempt_comm);
             bss.group_size = opts.group_size;
+            bss.balance = u64::from(!opts.no_balance);
         }
 
         let mut skel = scx_ops_load!(skel, knobs_ops, uei)?;
@@ -281,8 +301,8 @@ impl<'a> Scheduler<'a> {
     ) -> Result<UserExitInfo> {
         let interval = Duration::from_millis(opts.interval_ms.max(100));
         let mut tick = 0u64;
-        // sleep, slice_end, preempt, wake-preempt, exp-preempt, kick, q-local, q-global
-        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // sleep, slice_end, preempt, wake-preempt, exp-preempt, kick, q-local, q-global, lb-mig
+        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut cur_slice_ms = opts.slice_ms;
         let mut cur_period_ms = opts.period_ms;
         let mut cur_gran_us = opts.gran_us;
@@ -290,6 +310,7 @@ impl<'a> Scheduler<'a> {
         let mut cur_preempt = opts.always_preempt;
         let mut cur_pcomm = opts.preempt_comm.clone();
         let mut cur_group = opts.group_size;
+        let mut cur_balance = !opts.no_balance;
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             std::thread::sleep(interval);
@@ -353,6 +374,18 @@ impl<'a> Scheduler<'a> {
                             }
                         );
                     }
+                    Cmd::Balance(on) => {
+                        bss.balance = u64::from(on);
+                        cur_balance = on;
+                        println!(
+                            "balance -> {}",
+                            if on {
+                                "ON (home-full moves to lightest feasible group)"
+                            } else {
+                                "off (strict group isolation)"
+                            }
+                        );
+                    }
                 }
             }
 
@@ -367,6 +400,7 @@ impl<'a> Scheduler<'a> {
                 bss.nr_kick,
                 bss.nr_local_q,
                 bss.nr_global_q,
+                bss.nr_lb_migrate,
             );
             let d = (
                 cur.0 - last.0,
@@ -377,6 +411,7 @@ impl<'a> Scheduler<'a> {
                 cur.5 - last.5,
                 cur.6 - last.6,
                 cur.7 - last.7,
+                cur.8 - last.8,
             );
             last = cur;
 
@@ -391,7 +426,7 @@ impl<'a> Scheduler<'a> {
                 .collect();
 
             println!(
-                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} group={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={} | gload: [{}]",
+                "[{tick:5}] slice={} period={} gran={}us noswitch={} preempt={} pcomm={} group={} bal={} | stops: sleep={} slice_end={} preempt={} | wake-preempt={} name-pm={} kick={} | queue: local={} global={} lb-mig={} | gload: [{}]",
                 ms_str(cur_slice_ms, "dfl"),
                 ms_str(cur_period_ms, "off"),
                 cur_gran_us,
@@ -399,6 +434,7 @@ impl<'a> Scheduler<'a> {
                 if cur_preempt { "always" } else { "gated" },
                 if cur_pcomm.is_empty() { "off" } else { cur_pcomm.as_str() },
                 cur_group,
+                if cur_balance { "on" } else { "off" },
                 d.0,
                 d.1,
                 d.2,
@@ -407,6 +443,7 @@ impl<'a> Scheduler<'a> {
                 d.5,
                 d.6,
                 d.7,
+                d.8,
                 gloads.join(" "),
             );
         }
