@@ -448,6 +448,7 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 static __always_inline s32 pick_balance_group(struct task_struct *p, u32 home_grp)
 {
 	u64 g = gsize();
+	u64 home = (u64)home_grp;	/* 64-bit end to end: see ops.running */
 	u64 feasible[2] = {};
 	u64 min_load = ~0ULL, home_load = ~0ULL;
 	s32 best = -1;
@@ -482,10 +483,17 @@ static __always_inline s32 pick_balance_group(struct task_struct *p, u32 home_gr
 	if (best < 0 || (u32)best == home_grp)
 		return -1;
 
-	/* home must be heavier by more than the margin (one task) */
-	if (home_grp < GROUPS_MAX)
-		home_load = group_load[home_grp] +
-			    scx_bpf_dsq_nr_queued(queue_of(home_grp));
+	/*
+	 * home must be heavier by more than the margin (one task). The
+	 * bound and the array index run on the 64-bit @home on purpose:
+	 * a u32 compare compiles to a 32-bit branch that constrains only
+	 * the low half of the register, and the scaled group_load index
+	 * then leaks unbounded high bits into the map_value pointer add
+	 * (the same trap ops.running documents).
+	 */
+	if (home < GROUPS_MAX)
+		home_load = group_load[home] +
+			    scx_bpf_dsq_nr_queued(queue_of((u32)home));
 	if (min_load >= home_load)
 		return -1;
 
