@@ -484,16 +484,20 @@ static __always_inline s32 pick_balance_group(struct task_struct *p, u32 home_gr
 		return -1;
 
 	/*
-	 * home must be heavier by more than the margin (one task). The
-	 * bound and the array index run on the 64-bit @home on purpose:
-	 * a u32 compare compiles to a 32-bit branch that constrains only
-	 * the low half of the register, and the scaled group_load index
-	 * then leaks unbounded high bits into the map_value pointer add
-	 * (the same trap ops.running documents).
+	 * home must be heavier by more than the margin (one task). Bound
+	 * @home with an AND mask, NOT a `< GROUPS_MAX` check: the u32-born
+	 * value compiles the compare to a 32-bit branch that constrains
+	 * only the low half of the register, and the scaled group_load
+	 * index then leaks unbounded high bits into the map_value pointer
+	 * add -- even when the variable is u64, LLVM knows the upper bits
+	 * are zero and downgrades the compare. The mask survives (the
+	 * division result is not provably < GROUPS_MAX) and bounds the
+	 * whole register whether compiled as a 64-bit AND or a zero-
+	 * extending 32-bit AND. Same trick as pass 1 above.
 	 */
-	if (home < GROUPS_MAX)
-		home_load = group_load[home] +
-			    scx_bpf_dsq_nr_queued(queue_of((u32)home));
+	home &= (GROUPS_MAX - 1);
+	home_load = group_load[home] +
+		    scx_bpf_dsq_nr_queued(queue_of((u32)home));
 	if (min_load >= home_load)
 		return -1;
 
