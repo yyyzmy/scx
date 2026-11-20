@@ -304,19 +304,15 @@ static __always_inline s32 pick_idle_in_group(struct task_struct *p, s32 prev_cp
 
 	if (prev_cpu >= 0 && (u32)prev_cpu / (u32)g == grp) {
 		if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
-			bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d affinity-no",
-				   p->pid, p->comm, grp, prev_cpu);
+			/* TRACE-OFF: bpf_printk("... prev-fast ... affinity-no") */
 		} else if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d IDLE->TAKE",
-				   p->pid, p->comm, grp, prev_cpu);
+			/* TRACE-OFF: bpf_printk("... prev-fast ... IDLE->TAKE") */
 			return prev_cpu;
 		} else {
-			bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d busy",
-				   p->pid, p->comm, grp, prev_cpu);
+			/* TRACE-OFF: bpf_printk("... prev-fast ... busy") */
 		}
 	} else if (prev_cpu >= 0) {
-		bpf_printk("knobs: pid=%d(%s) prev-fast grp=%u prev=%d prev-not-in-grp",
-			   p->pid, p->comm, grp, prev_cpu);
+		/* TRACE-OFF: bpf_printk("... prev-fast ... prev-not-in-grp") */
 	}
 
 	bpf_for(i, 0, GROUP_MAX) {
@@ -328,21 +324,17 @@ static __always_inline s32 pick_idle_in_group(struct task_struct *p, s32 prev_cp
 		cpu = base + i;
 		/* false for out-of-range CPUs too */
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-			bpf_printk("knobs: pid=%d(%s) scan grp=%u cpu=%d no-affinity",
-				   p->pid, p->comm, grp, cpu);
+			/* TRACE-OFF: bpf_printk("... scan ... no-affinity") */
 			continue;
 		}
 		if (!scx_bpf_test_and_clear_cpu_idle(cpu)) {
-			bpf_printk("knobs: pid=%d(%s) scan grp=%u cpu=%d busy",
-				   p->pid, p->comm, grp, cpu);
+			/* TRACE-OFF: bpf_printk("... scan ... busy") */
 			continue;
 		}
-		bpf_printk("knobs: pid=%d(%s) scan grp=%u cpu=%d IDLE->TAKE",
-			   p->pid, p->comm, grp, cpu);
+		/* TRACE-OFF: bpf_printk("... scan ... IDLE->TAKE") */
 		return cpu;
 	}
-	bpf_printk("knobs: pid=%d(%s) grp=%u group-full (-1)",
-		   p->pid, p->comm, grp);
+	/* TRACE-OFF: bpf_printk("... group-full (-1)") */
 	return -1;
 }
 
@@ -387,9 +379,7 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 
 	homep = bpf_map_lookup_elem(&proc_group, &tgid);
 	if (homep) {
-		bpf_printk("knobs: pid=%d(%s) grp-lookup tgid=%d home_cpu=%d g=%llu grp=%u",
-			   p->pid, p->comm, tgid, *homep, gsize(),
-			   *homep / (u32)gsize());
+		/* TRACE-OFF: bpf_printk("... grp-lookup ...") */
 		return *homep / (u32)gsize();
 	}
 
@@ -418,9 +408,7 @@ static __always_inline u32 proc_group_of(struct task_struct *p, s32 cpu)
 			home = (u32)ok;
 	}
 
-	bpf_printk("knobs: pid=%d(%s) grp-LEARN tgid=%d from_cpu=%d home=%u g=%llu grp=%u",
-		   p->pid, p->comm, tgid, cpu, home, gsize(),
-		   home / (u32)gsize());
+	/* TRACE-OFF: bpf_printk("... grp-LEARN ...") */
 	bpf_map_update_elem(&proc_group, &tgid, &home, BPF_NOEXIST);
 	return home / (u32)gsize();
 }
@@ -545,8 +533,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		if ((u32)prev_cpu / (u32)g == grp &&
 		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
 		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			bpf_printk("knobs: pid=%d(%s) prev-first grp=%u prev=%d IDLE->TAKE",
-				   p->pid, p->comm, grp, prev_cpu);
+			/* TRACE-OFF: bpf_printk("... prev-first ... IDLE->TAKE") */
 			dispatch_local(p, queue_of(grp));
 			return prev_cpu;
 		}
@@ -554,8 +541,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		/* 2. dfl: topology-aware, accepted only inside the group */
 		dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 		if (is_idle && dfl >= 0 && (u32)dfl / (u32)g == grp) {
-			bpf_printk("knobs: pid=%d(%s) select dfl-in-grp dfl=%d",
-				   p->pid, p->comm, dfl);
+			/* TRACE-OFF: bpf_printk("... select dfl-in-grp ...") */
 			dispatch_local(p, queue_of(grp));
 			return dfl;
 		}
@@ -590,9 +576,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 					bpf_map_update_elem(&proc_group, &tgid,
 							    &newhome, BPF_ANY);
 					__sync_fetch_and_add(&nr_lb_migrate, 1);
-					bpf_printk("knobs: pid=%d(%s) LB-MIGRATE tgid=%d grp=%u->%u cpu=%d",
-						   p->pid, p->comm, tgid, grp,
-						   (u32)bal, cpu);
+					/* TRACE-OFF: bpf_printk("... LB-MIGRATE ...") */
 					dispatch_local(p, queue_of((u32)bal));
 					return cpu;
 				}
@@ -608,14 +592,12 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		 * first CPU of the group the affinity allows.
 		 */
 		if ((u32)prev_cpu / (u32)g == grp) {
-			bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d",
-				   p->pid, p->comm, prev_cpu);
+			/* TRACE-OFF: bpf_printk("... home-full stay prev ...") */
 			return prev_cpu;
 		}
 		cpu = any_cpu_in_group(p, grp);
 		if (cpu >= 0) {
-			bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d",
-				   p->pid, p->comm, cpu);
+			/* TRACE-OFF: bpf_printk("... home-full first-legal ...") */
 			return cpu;
 		}
 		/*
@@ -647,9 +629,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 				bpf_map_update_elem(&proc_group, &tgid,
 						    &newhome, BPF_ANY);
-				bpf_printk("knobs: pid=%d(%s) home-RELEARN tgid=%d old_grp=%u new_home=%u grp=%u",
-					   p->pid, p->comm, tgid, grp,
-					   newhome, newhome / (u32)g);
+				/* TRACE-OFF: bpf_printk("... home-RELEARN ...") */
 				/*
 				 * Pick an idle CPU in the new group
 				 * right away; fall through to the
@@ -666,12 +646,10 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 					return cpu;
 				}
 				if ((u32)prev_cpu / (u32)g == newhome / (u32)g) {
-					bpf_printk("knobs: pid=%d(%s) home-full stay prev=%d (relearned)",
-						   p->pid, p->comm, prev_cpu);
+					/* TRACE-OFF: bpf_printk("... home-full stay prev ... (relearned)") */
 					return prev_cpu;
 				}
-				bpf_printk("knobs: pid=%d(%s) home-full first-legal cpu=%d (relearned)",
-					   p->pid, p->comm, ok);
+				/* TRACE-OFF: bpf_printk("... home-full first-legal ... (relearned)") */
 				return ok;
 			}
 		}
@@ -680,8 +658,7 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		 * empty?): fall back to plain dfl placement, computed in
 		 * step 2 above.
 		 */
-		bpf_printk("knobs: pid=%d(%s) affinity-excludes-home dfl=%d",
-			   p->pid, p->comm, dfl);
+		/* TRACE-OFF: bpf_printk("... affinity-excludes-home ...") */
 		if (is_idle)
 			dispatch_local(p, queue_of((u32)dfl / (u32)g));
 		return dfl;
