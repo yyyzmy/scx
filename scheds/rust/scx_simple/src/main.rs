@@ -56,7 +56,7 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf_opts.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, simple_ops, open_opts)?;
 
-        skel.maps.rodata_data.fifo_sched = opts.fifo_sched;
+        skel.maps.rodata_data.as_mut().unwrap().fifo_sched = opts.fifo_sched;
 
         let mut skel = scx_ops_load!(skel, simple_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, simple_ops)?);
