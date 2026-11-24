@@ -38,19 +38,9 @@ UEI_DEFINE(uei);
  */
 #define SHARED_DSQ 0
 
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(key_size, sizeof(u32));
-	__uint(value_size, sizeof(u64));
-	__uint(max_entries, 2);			/* [local, global] */
-} stats SEC(".maps");
-
-static void stat_inc(u32 idx)
-{
-	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
-	if (cnt_p)
-		(*cnt_p)++;
-}
+/* BSS counters, read live by userspace through the skeleton (non-static). */
+u64 nr_local_q;         /* direct-dispatched to an idle CPU */
+u64 nr_global_q;        /* queued on the shared DSQ */
 
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
@@ -59,7 +49,7 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
-		stat_inc(0);	/* count local queueing */
+		__sync_fetch_and_add(&nr_local_q, 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 	}
 
@@ -68,7 +58,7 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	stat_inc(1);	/* count global queueing */
+	__sync_fetch_and_add(&nr_global_q, 1);
 
 	if (fifo_sched) {
 		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);

@@ -17,7 +17,6 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
-use libbpf_rs::MapFlags;
 use log::info;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::try_set_rlimit_infinity;
@@ -43,21 +42,6 @@ struct Opts {
     libbpf_opts: LibbpfOpts,
 }
 
-fn sum_percpu(skel: &BpfSkel<'_>, idx: u32) -> u64 {
-    let key = idx.to_ne_bytes();
-    match skel
-        .maps
-        .stats
-        .lookup_percpu(&key, MapFlags::ANY)
-    {
-        Ok(Some(vals)) => vals
-            .iter()
-            .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap()))
-            .sum(),
-        _ => 0,
-    }
-}
-
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -69,7 +53,7 @@ impl<'a> Scheduler<'a> {
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
-        let open_opts = opts.libbpf.clone().into_bpf_open_opts();
+        let open_opts = opts.libbpf_opts.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, simple_ops, open_opts)?;
 
         skel.rodata_mut().fifo_sched = opts.fifo_sched;
@@ -92,8 +76,8 @@ impl<'a> Scheduler<'a> {
             std::thread::sleep(Duration::from_secs(1));
             tick += 1;
 
-            let local = sum_percpu(&self.skel, 0);
-            let global = sum_percpu(&self.skel, 1);
+            let local = self.skel.maps.bss_data.nr_local_q;
+            let global = self.skel.maps.bss_data.nr_global_q;
             println!(
                 "[{tick:5}] local={} global={} | d local={} d global={}",
                 local,
