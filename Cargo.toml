@@ -16,6 +16,7 @@ members = [
     "scheds/rust/scx_knobs",
     "scheds/rust/scx_partial",
     "scheds/rust/scx_redis",
+    "scheds/rust/scx_simple",
     "scheds/rust/scx_cluster",
     "scheds/rust/scx_cake",
     "scheds/rust/scx_chaos",
