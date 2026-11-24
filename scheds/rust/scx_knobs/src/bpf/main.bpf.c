@@ -527,6 +527,24 @@ s32 BPF_STRUCT_OPS(knobs_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * claims gets discarded, so the last resort is our own group scan.
 	 */
 	if (g && prev_cpu >= 0) {
+		/*
+		 * 0. absolute prev fast path: when cores are plentiful the
+		 * common wakeup case is "prev idle and affinity-allowed".
+		 * Claim it before the proc_group map lookup, so the hot path
+		 * costs one cpumask test plus one atomic idle claim and
+		 * nothing else (no map lookup, no bookkeeping). Slice comes
+		 * from prev's own group queue. Home was learned from an
+		 * earlier prev, so the two normally coincide; when they do
+		 * not (after a balance migrate), running once on prev's group
+		 * is still inside the affinity mask and keeps the wakeup
+		 * cheap.
+		 */
+		if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			dispatch_local(p, queue_of((u32)prev_cpu / (u32)g));
+			return prev_cpu;
+		}
+
 		grp = proc_group_of(p, prev_cpu);
 
 		/* 1. prev_cpu alone: cache-warm, no dfl claim when it hits */
