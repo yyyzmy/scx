@@ -135,11 +135,11 @@ impl<'a> Scheduler<'a> {
             ["slice", name, us] => match (comm_key(name), us.parse::<u64>()) {
                 (Ok(key), Ok(us)) => {
                     let ns = us * 1000;
-                    match self
-                        .skel
-                        .maps
-                        .comm_slice
-                        .update(&key, &ns, MapFlags::ANY)
+                    match self.skel.maps.comm_slice.update(
+                        &key,
+                        &ns.to_ne_bytes(),
+                        MapFlags::ANY,
+                    )
                     {
                         Ok(()) => {
                             slices.retain(|(n, _)| n != name);
