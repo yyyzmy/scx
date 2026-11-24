@@ -89,7 +89,8 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	/* compat macro: newer kernels take (dsq_id, enq_flags); 0 = old behavior */
+	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 }
 
 void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
