@@ -55,7 +55,10 @@ struct {
 
 static u64 eff_slice(struct task_struct *p)
 {
-	u64 *v = bpf_map_lookup_elem(&comm_slice, p->comm);
+	char comm[16];
+
+	__builtin_memcpy(comm, p->comm, sizeof(comm));
+	u64 *v = bpf_map_lookup_elem(&comm_slice, comm);
 	return v ? *v : SCX_SLICE_DFL;
 }
 
