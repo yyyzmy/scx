@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::{MapFlags, OpenObject};
+use libbpf_rs::{MapCore, MapFlags, OpenObject};
 use log::info;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::try_set_rlimit_infinity;
