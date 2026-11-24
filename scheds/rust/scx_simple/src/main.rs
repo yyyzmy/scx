@@ -56,7 +56,7 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf_opts.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, simple_ops, open_opts)?;
 
-        skel.rodata_mut().fifo_sched = opts.fifo_sched;
+        skel.maps.rodata_data.fifo_sched = opts.fifo_sched;
 
         let mut skel = scx_ops_load!(skel, simple_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, simple_ops)?);
@@ -76,8 +76,9 @@ impl<'a> Scheduler<'a> {
             std::thread::sleep(Duration::from_secs(1));
             tick += 1;
 
-            let local = self.skel.maps.bss_data.nr_local_q;
-            let global = self.skel.maps.bss_data.nr_global_q;
+            let bss = self.skel.maps.bss_data.as_mut().unwrap();
+            let local = bss.nr_local_q;
+            let global = bss.nr_global_q;
             println!(
                 "[{tick:5}] local={} global={} | d local={} d global={}",
                 local,
