@@ -9,14 +9,16 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 
+use std::io::BufRead;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::OpenObject;
+use libbpf_rs::{MapFlags, OpenObject};
 use log::info;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::try_set_rlimit_infinity;
@@ -71,16 +73,50 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let mut last = (0u64, 0u64);
         let mut tick = 0u64;
+        let mut slices: Vec<(String, u64)> = Vec::new(); /* userspace-side record for display */
+
+        let (tx, rx): (Sender<String>, Receiver<String>) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        println!("commands: 'slice NAME US' | 'unslice NAME'  (US = microseconds)");
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            std::thread::sleep(Duration::from_secs(1));
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(line) => self.handle_command(&line, &mut slices),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
             tick += 1;
 
             let bss = self.skel.maps.bss_data.as_mut().unwrap();
             let local = bss.nr_local_q;
             let global = bss.nr_global_q;
+            let slices_str = if slices.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " | slices: {}",
+                    slices
+                        .iter()
+                        .map(|(n, ns)| format!("{n}={}", ns / 1000))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
             println!(
-                "[{tick:5}] local={} global={} | d local={} d global={}",
+                "[{tick:5}] local={} global={} | d local={} d global={}{slices_str}",
                 local,
                 global,
                 local - last.0,
@@ -92,6 +128,50 @@ impl<'a> Scheduler<'a> {
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
+
+    fn handle_command(&mut self, line: &str, slices: &mut Vec<(String, u64)>) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            ["slice", name, us] => match (comm_key(name), us.parse::<u64>()) {
+                (Ok(key), Ok(us)) => {
+                    let ns = us * 1000;
+                    match self
+                        .skel
+                        .maps
+                        .comm_slice
+                        .update(&key, &ns, MapFlags::ANY)
+                    {
+                        Ok(()) => {
+                            slices.retain(|(n, _)| n != name);
+                            slices.push((name.to_string(), ns));
+                            println!("slice: {name} = {us}us");
+                        }
+                        Err(e) => println!("slice: map update failed: {e}"),
+                    }
+                }
+                (Err(e), _) => println!("slice: {e}"),
+                (_, Err(_)) => println!("slice: invalid microseconds '{us}'"),
+            },
+            ["unslice", name] => match comm_key(name) {
+                Ok(key) => {
+                    let _ = self.skel.maps.comm_slice.delete(&key);
+                    slices.retain(|(n, _)| n != name);
+                    println!("slice: {name} -> default");
+                }
+                Err(e) => println!("unslice: {e}"),
+            },
+            [] => {}
+            _ => println!("unknown command, try: 'slice NAME US' | 'unslice NAME'"),
+        }
+    }
+}
+
+fn comm_key(name: &str) -> Result<[u8; 16]> {
+    let bytes = name.as_bytes();
+    anyhow::ensure!(bytes.len() < 16, "comm too long (max 15 chars)");
+    let mut key = [0u8; 16];
+    key[..bytes.len()].copy_from_slice(bytes);
+    Ok(key)
 }
 
 impl Drop for Scheduler<'_> {

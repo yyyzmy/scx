@@ -42,6 +42,23 @@ UEI_DEFINE(uei);
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on the shared DSQ */
 
+/*
+ * Per-comm custom slices: exact task comm (16B, NUL-padded) -> slice in ns.
+ * Set from userspace at runtime; lookup miss falls back to SCX_SLICE_DFL.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, char[16]);
+	__type(value, u64);
+	__uint(max_entries, 64);
+} comm_slice SEC(".maps");
+
+static u64 eff_slice(struct task_struct *p)
+{
+	u64 *v = bpf_map_lookup_elem(&comm_slice, p->comm);
+	return v ? *v : SCX_SLICE_DFL;
+}
+
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	bool is_idle = false;
@@ -50,7 +67,7 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
 		__sync_fetch_and_add(&nr_local_q, 1);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, eff_slice(p), 0);
 	}
 
 	return cpu;
@@ -58,10 +75,12 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	u64 slice = eff_slice(p);
+
 	__sync_fetch_and_add(&nr_global_q, 1);
 
 	if (fifo_sched) {
-		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+		scx_bpf_dsq_insert(p, SHARED_DSQ, slice, enq_flags);
 	} else {
 		u64 vtime = p->scx.dsq_vtime;
 
@@ -69,10 +88,10 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		 * Limit the amount of budget that an idling task can accumulate
 		 * to one slice.
 		 */
-		if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
-			vtime = vtime_now - SCX_SLICE_DFL;
+		if (time_before(vtime, vtime_now - slice))
+			vtime = vtime_now - slice;
 
-		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
+		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime,
 					 enq_flags);
 	}
 }
@@ -105,14 +124,16 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
 
 	/*
 	 * Scale the execution time by the inverse of the weight and charge.
-	 *
-	 * Note that the default yield implementation yields by setting
-	 * @p->scx.slice to zero and the following would treat the yielding task
-	 * as if it has consumed all its slice. If this penalizes yielding tasks
-	 * too much, determine the execution time by taking explicit timestamps
-	 * instead of depending on @p->scx.slice.
+	 * Charge against the slice that was actually assigned (per-comm entry
+	 * may have changed between insert and stop); guard against underflow.
 	 */
-	p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+	{
+		u64 slice = eff_slice(p);
+
+		if (p->scx.slice < slice)
+			p->scx.dsq_vtime += (slice - p->scx.slice) * 100 /
+					     p->scx.weight;
+	}
 }
 
 void BPF_STRUCT_OPS(simple_enable, struct task_struct *p)
