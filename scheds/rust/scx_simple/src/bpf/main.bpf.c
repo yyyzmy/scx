@@ -96,11 +96,18 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		u64 vtime = p->scx.dsq_vtime;
 
 		/*
-		 * Limit the amount of budget that an idling task can accumulate
-		 * to one slice.
+		 * Limit the amount of budget that an idling task can
+		 * accumulate to one slice. The floor must use the same
+		 * scaled units as vtime charges (a full slice costs
+		 * slice * 100 / weight in stopping); using the raw slice
+		 * value here banked ~10x one slice of credit at nice-0
+		 * (weight 1024), letting sleepers stay parked behind the
+		 * runner for ~10 slices after waking.
 		 */
-		if (time_before(vtime, vtime_now - slice))
-			vtime = vtime_now - slice;
+		u64 floor = vtime_now - slice * 100 / p->scx.weight;
+
+		if (time_before(vtime, floor))
+			vtime = floor;
 
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime,
 					 enq_flags);
