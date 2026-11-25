@@ -59,6 +59,7 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_open!(skel_builder, open_object, simple_ops, open_opts)?;
 
         skel.maps.rodata_data.as_mut().unwrap().fifo_sched = opts.fifo_sched;
+        skel.maps.bss_data.as_mut().unwrap().slice_base_ns = 2_800_000;
 
         let mut skel = scx_ops_load!(skel, simple_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, simple_ops)?);
@@ -90,7 +91,7 @@ impl<'a> Scheduler<'a> {
             }
         });
 
-        println!("commands: 'slice NAME US' | 'unslice NAME'  (US = microseconds)");
+        println!("commands: 'slice NAME US' | 'unslice NAME' | 'base US'  (US = microseconds)");
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             match rx.recv_timeout(Duration::from_secs(1)) {
@@ -103,6 +104,7 @@ impl<'a> Scheduler<'a> {
             let bss = self.skel.maps.bss_data.as_mut().unwrap();
             let local = bss.nr_local_q;
             let global = bss.nr_global_q;
+            let base_us = bss.slice_base_ns / 1000;
             let slices_str = if slices.is_empty() {
                 String::new()
             } else {
@@ -116,7 +118,7 @@ impl<'a> Scheduler<'a> {
                 )
             };
             println!(
-                "[{tick:5}] local={} global={} | d local={} d global={}{slices_str}",
+                "[{tick:5}] base={base_us}us | local={} global={} | d local={} d global={}{slices_str}",
                 local,
                 global,
                 local - last.0,
@@ -160,8 +162,15 @@ impl<'a> Scheduler<'a> {
                 }
                 Err(e) => println!("unslice: {e}"),
             },
+            ["base", us] => match us.parse::<u64>() {
+                Ok(us) => {
+                    self.skel.maps.bss_data.as_mut().unwrap().slice_base_ns = us * 1000;
+                    println!("base slice: {us}us");
+                }
+                Err(_) => println!("base: invalid microseconds '{us}'"),
+            },
             [] => {}
-            _ => println!("unknown command, try: 'slice NAME US' | 'unslice NAME'"),
+            _ => println!("unknown command, try: 'slice NAME US' | 'unslice NAME' | 'base US'"),
         }
     }
 }

@@ -38,6 +38,12 @@ UEI_DEFINE(uei);
  */
 #define SHARED_DSQ 0
 
+/* base fallback slice default: 2.8ms (comm_slice entries override per task) */
+#define SLICE_BASE_DFL_NS 2800000ULL
+
+/* runtime-adjustable base slice (BSS, non-static for skeleton visibility) */
+u64 slice_base_ns;
+
 /* BSS counters, read live by userspace through the skeleton (non-static). */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on the shared DSQ */
@@ -59,7 +65,9 @@ static u64 eff_slice(struct task_struct *p)
 
 	__builtin_memcpy(comm, p->comm, sizeof(comm));
 	u64 *v = bpf_map_lookup_elem(&comm_slice, comm);
-	return v ? *v : SCX_SLICE_DFL;
+	if (v)
+		return *v;
+	return slice_base_ns ? slice_base_ns : SLICE_BASE_DFL_NS;
 }
 
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
