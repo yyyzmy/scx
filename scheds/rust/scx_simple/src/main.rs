@@ -93,7 +93,7 @@ impl<'a> Scheduler<'a> {
         });
 
         println!(
-            "commands: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US'  (US = microseconds)"
+            "commands: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US' | 'vtrace on|off'  (US = microseconds)"
         );
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
@@ -191,9 +191,17 @@ impl<'a> Scheduler<'a> {
                 }
                 Err(_) => println!("gran: invalid microseconds '{us}'"),
             },
+            ["vtrace", "on"] => {
+                self.skel.maps.bss_data.as_mut().unwrap().vtrace = 1;
+                println!("vtime trace: on (read /sys/kernel/tracing/trace_pipe)");
+            }
+            ["vtrace", "off"] => {
+                self.skel.maps.bss_data.as_mut().unwrap().vtrace = 0;
+                println!("vtime trace: off");
+            }
             [] => {}
             _ => println!(
-                "unknown command, try: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US'"
+                "unknown command, try: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US' | 'vtrace on|off'"
             ),
         }
     }

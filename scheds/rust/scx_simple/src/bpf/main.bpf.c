@@ -53,6 +53,7 @@ u64 nr_kick;            /* SCX_KICK_PREEMPT IPIs sent */
 /* Wakeup preemption knobs (BSS, runtime-adjustable from userspace). */
 u64 preempt_en;         /* 1 = waking tasks with credit may preempt */
 u64 preempt_gran_ns;    /* wakeup granularity gate in wall ns (0 = eager) */
+u64 vtrace;             /* 1 = print vtime decisions (enqueue/running/stopping) */
 
 /*
  * Per-comm custom slices: exact task comm (16B, NUL-padded) -> slice in ns.
@@ -115,6 +116,17 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		if (time_before(vtime, floor))
 			vtime = floor;
 
+		if (vtrace) {
+			char comm[16];
+
+			__builtin_memcpy(comm, p->comm, sizeof(comm));
+			bpf_printk("ENQ %c%c %s old=%llu now=%llu floor=%llu new=%llu sl=%llu w=%u",
+				   (enq_flags & SCX_ENQ_WAKEUP) ? 'W' : '-',
+				   (enq_flags & SCX_ENQ_REENQ) ? 'R' : '-',
+				   comm, p->scx.dsq_vtime, vtime_now, floor,
+				   vtime, slice, p->scx.weight);
+		}
+
 		/*
 		 * Wakeup preemption: a waking task with banked vtime
 		 * credit may preempt the runner it lands on instead of
@@ -163,6 +175,14 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 	if (fifo_sched)
 		return;
 
+	if (vtrace) {
+		char comm[16];
+
+		__builtin_memcpy(comm, p->comm, sizeof(comm));
+		bpf_printk("RUN %s v=%llu now=%llu",
+			   comm, p->scx.dsq_vtime, vtime_now);
+	}
+
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
 	 * test and update can be performed concurrently from multiple CPUs and
@@ -186,9 +206,20 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
 	{
 		u64 slice = eff_slice(p);
 
-		if (p->scx.slice < slice)
-			p->scx.dsq_vtime += (slice - p->scx.slice) * 100 /
-					     p->scx.weight;
+		if (p->scx.slice < slice) {
+			u64 charge = (slice - p->scx.slice) * 100 /
+				     p->scx.weight;
+
+			p->scx.dsq_vtime += charge;
+			if (vtrace) {
+				char comm[16];
+
+				__builtin_memcpy(comm, p->comm, sizeof(comm));
+				bpf_printk("STP %s remain=%llu sl=%llu charge=%llu newv=%llu",
+					   comm, (u64)p->scx.slice, slice,
+					   charge, p->scx.dsq_vtime);
+			}
+		}
 	}
 }
 
