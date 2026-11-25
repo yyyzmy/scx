@@ -47,6 +47,12 @@ u64 slice_base_ns;
 /* BSS counters, read live by userspace through the skeleton (non-static). */
 u64 nr_local_q;         /* direct-dispatched to an idle CPU */
 u64 nr_global_q;        /* queued on the shared DSQ */
+u64 nr_wakeup_preempt;  /* enqueues that armed SCX_ENQ_PREEMPT via the gate */
+u64 nr_kick;            /* SCX_KICK_PREEMPT IPIs sent */
+
+/* Wakeup preemption knobs (BSS, runtime-adjustable from userspace). */
+u64 preempt_en;         /* 1 = waking tasks with credit may preempt */
+u64 preempt_gran_ns;    /* wakeup granularity gate in wall ns (0 = eager) */
 
 /*
  * Per-comm custom slices: exact task comm (16B, NUL-padded) -> slice in ns.
@@ -109,8 +115,40 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		if (time_before(vtime, floor))
 			vtime = floor;
 
+		/*
+		 * Wakeup preemption: a waking task with banked vtime
+		 * credit may preempt the runner it lands on instead of
+		 * waiting for that runner's slice to end. The credit is
+		 * capped at one slice by the clamp above; multiplying by
+		 * weight / 100 converts the scaled vtime credit back to
+		 * wall-time ns, so the gate matches CFS wakeup
+		 * granularity semantics.
+		 */
+		if (preempt_en && (enq_flags & SCX_ENQ_WAKEUP)) {
+			u64 credit = vtime_now - vtime;
+
+			if ((s64)credit > 0 &&
+			    credit * p->scx.weight / 100 > preempt_gran_ns) {
+				enq_flags |= SCX_ENQ_PREEMPT;
+				__sync_fetch_and_add(&nr_wakeup_preempt, 1);
+			}
+		}
+
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime,
 					 enq_flags);
+
+		/*
+		 * A DSQ insert only pends the target rq's resched; a task
+		 * spinning in userspace does not act on it until its next
+		 * tick. Kick the target CPU so the switch happens now.
+		 * The kick must come after the insert: the IPI'd CPU
+		 * dispatches from the DSQ immediately and must find the
+		 * task already queued.
+		 */
+		if (enq_flags & SCX_ENQ_PREEMPT) {
+			scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
+			__sync_fetch_and_add(&nr_kick, 1);
+		}
 	}
 }
 
