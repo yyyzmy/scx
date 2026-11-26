@@ -88,6 +88,12 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	if (is_idle) {
 		__sync_fetch_and_add(&nr_local_q, 1);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, eff_slice(p), 0);
+		if (vtrace) {
+			char comm[16];
+
+			__builtin_memcpy(comm, p->comm, sizeof(comm));
+			bpf_printk("LOC %d %s sl=%llu", cpu, comm, eff_slice(p));
+		}
 	}
 
 	return cpu;
@@ -181,8 +187,8 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 		char comm[16];
 
 		__builtin_memcpy(comm, p->comm, sizeof(comm));
-		bpf_printk("RUN %s v=%llu now=%llu",
-			   comm, p->scx.dsq_vtime, vtime_now);
+		bpf_printk("RUN %s v=%llu now=%llu sl=%llu",
+			   comm, p->scx.dsq_vtime, vtime_now, p->scx.slice);
 	}
 
 	/*
