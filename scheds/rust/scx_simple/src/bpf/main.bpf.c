@@ -59,6 +59,13 @@ u64 tick_cpu;           /* with vtrace on, only this CPU prints TCK lines */
 u64 nr_dfl;             /* kernel SCX_SLICE_DFL refills caught and rewritten */
 
 /*
+ * Per-CPU stint start time (bpf_ktime_get_ns), recorded at ops.running so
+ * ops.tick can enforce the wall upper bound from the ORIGINAL stint start
+ * (lavd-style), instead of trusting the kernel-side slice countdown.
+ */
+u64 stint_clk[128];
+
+/*
  * Per-comm custom slices: exact task comm (16B, NUL-padded) -> slice in ns.
  * Set from userspace at runtime; lookup miss falls back to SCX_SLICE_DFL.
  */
@@ -211,10 +218,24 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 	 */
 	{
 		u64 slice = eff_slice(p);
+		u32 cpu = scx_bpf_task_cpu(p);
+
+		/*
+		 * lavd_running(): if the core handed out SCX_SLICE_DFL, this
+		 * dispatch skipped ops.enqueue (kernel direct dispatch), so
+		 * the sleeper's vtime never got clamped to the floor; reset
+		 * it to the clock. Skip when our own policy IS the default,
+		 * or the fingerprint cannot tell the two apart.
+		 */
+		if (p->scx.slice == SCX_SLICE_DFL && slice != SCX_SLICE_DFL)
+			p->scx.dsq_vtime = vtime_now;
 
 		if (p->scx.slice != slice)
 			__sync_fetch_and_add(&nr_dfl, 1);
 		p->scx.slice = slice;
+
+		if (cpu < 128)
+			stint_clk[cpu] = bpf_ktime_get_ns();
 	}
 }
 
@@ -273,21 +294,43 @@ void BPF_STRUCT_OPS(simple_tick, struct task_struct *p, int nr_cpus)
 	}
 
 	/*
-	 * A stint that expires with nothing else runnable on the rq is NOT
-	 * requeueed through ops.enqueue: this kernel keeps the task running
-	 * and refills p->scx.slice with SCX_SLICE_DFL (20ms). That refill is
-	 * blind to user-DSQ contents, so tasks queued on SHARED_DSQ can
-	 * starve for a full 20ms -- and no ops.running callback fires (no new
-	 * stint starts), so the unconditional rewrite above cannot catch it.
-	 * Only this callback sees the oversized budget: cap it back to
-	 * policy. No-op for normal stints (their budget <= eff_slice()).
+	 * lavd-style wall-clock enforcement (shrink_slice_at_tick). The
+	 * kernel-side slice countdown is untrusted: a stint that expires
+	 * with nothing else runnable on the rq is NOT requeued through
+	 * ops.enqueue -- this kernel keeps the task running and refills
+	 * p->scx.slice with SCX_SLICE_DFL (20ms), blind to user-DSQ
+	 * contents, and no ops.running fires, so the rewrite above cannot
+	 * see it. Recompute the remaining budget from the stint start
+	 * recorded at ops.running: capping a refill to a FRESH policy
+	 * budget would extend the stint, so once the wall time reaches
+	 * eff_slice(), write zero and the core ends the stint at this
+	 * scheduling point. Writing zero is safe ONLY here (ops.tick is a
+	 * scheduling point); the core "fixes" zero slices written elsewhere
+	 * to SCX_SLICE_DFL -- see lavd's ask_cpu_yield_after().
 	 */
 	{
 		u64 slice = eff_slice(p);
+		u64 start = cpu < 128 ? READ_ONCE(stint_clk[cpu]) : 0;
 
-		if (p->scx.slice > slice) {
-			p->scx.slice = slice;
+		if (p->scx.slice > slice)
 			__sync_fetch_and_add(&nr_dfl, 1);
+
+		if (start) {
+			u64 dur = bpf_ktime_get_ns() - start;
+
+			if (dur >= slice) {
+				/* wall budget exhausted: end the stint now */
+				p->scx.slice = 0;
+			} else {
+				u64 remain = slice - dur;
+
+				if (p->scx.slice > remain)
+					p->scx.slice = remain;
+			}
+		} else if (p->scx.slice > slice) {
+			/* no stint start on record (e.g. task already running
+			 * when the scheduler attached): fall back to plain cap */
+			p->scx.slice = slice;
 		}
 	}
 }
