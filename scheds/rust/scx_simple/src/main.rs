@@ -74,7 +74,7 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
-        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut tick = 0u64;
         let mut slices: Vec<(String, u64)> = Vec::new(); /* userspace-side record for display */
 
@@ -111,6 +111,7 @@ impl<'a> Scheduler<'a> {
             let wpre = bss.nr_wakeup_preempt;
             let kick = bss.nr_kick;
             let n_tick = bss.nr_tick;
+            let dfl = bss.nr_dfl;
             let base_us = bss.slice_base_ns / 1000;
             let slices_str = if slices.is_empty() {
                 String::new()
@@ -125,16 +126,17 @@ impl<'a> Scheduler<'a> {
                 )
             };
             println!(
-                "[{tick:5}] base={base_us}us | local={} global={} | d local={} d global={} | d pre={} d kick={} | d tick={}{slices_str}",
+                "[{tick:5}] base={base_us}us | local={} global={} | d local={} d global={} | d pre={} d kick={} | d tick={} d dfl={}{slices_str}",
                 local,
                 global,
                 local - last.0,
                 global - last.1,
                 wpre - last.2,
                 kick - last.3,
-                n_tick - last.4
+                n_tick - last.4,
+                dfl - last.5
             );
-            last = (local, global, wpre, kick, n_tick);
+            last = (local, global, wpre, kick, n_tick, dfl);
         }
 
         let _ = self.struct_ops.take();

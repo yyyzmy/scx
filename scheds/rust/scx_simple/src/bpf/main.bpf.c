@@ -56,6 +56,7 @@ u64 preempt_gran_ns;    /* wakeup granularity gate in wall ns (0 = eager) */
 u64 vtrace;             /* 1 = print vtime decisions (enqueue/running/stopping) */
 u64 nr_tick;            /* ops.tick invocations; VM steal makes this rate sag */
 u64 tick_cpu;           /* with vtrace on, only this CPU prints TCK lines */
+u64 nr_dfl;             /* kernel SCX_SLICE_DFL refills caught and rewritten */
 
 /*
  * Per-comm custom slices: exact task comm (16B, NUL-padded) -> slice in ns.
@@ -199,6 +200,22 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 	 */
 	if (time_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
+
+	/*
+	 * Unconditionally rewrite the budget at every stint start, like
+	 * lavd_running(): whatever the sched_ext core handed out -- a direct
+	 * dispatch that skipped ops.enqueue, a keep-running refill, anything
+	 * -- our policy wins. Side benefit: the budget is always eff_slice(p)
+	 * at stint start, so the stopping-time charge (eff_slice - remaining)
+	 * is exact even if the per-comm entry changed between insert and stop.
+	 */
+	{
+		u64 slice = eff_slice(p);
+
+		if (p->scx.slice != slice)
+			__sync_fetch_and_add(&nr_dfl, 1);
+		p->scx.slice = slice;
+	}
 }
 
 void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
@@ -232,7 +249,6 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
 }
 
 /*
-/*
  * Tick probe. The kernel calls tick(current_task, nr_cpus); the CPU id
  * comes from scx_bpf_task_cpu(p). nr_tick counts every CPU's tick
  * unconditionally: on a healthy machine that is (busy CPUs) * HZ per
@@ -254,6 +270,25 @@ void BPF_STRUCT_OPS(simple_tick, struct task_struct *p, int nr_cpus)
 
 		__builtin_memcpy(comm, p->comm, sizeof(comm));
 		bpf_printk("TCK %d cur=%s sl=%llu", cpu, comm, sl);
+	}
+
+	/*
+	 * A stint that expires with nothing else runnable on the rq is NOT
+	 * requeueed through ops.enqueue: this kernel keeps the task running
+	 * and refills p->scx.slice with SCX_SLICE_DFL (20ms). That refill is
+	 * blind to user-DSQ contents, so tasks queued on SHARED_DSQ can
+	 * starve for a full 20ms -- and no ops.running callback fires (no new
+	 * stint starts), so the unconditional rewrite above cannot catch it.
+	 * Only this callback sees the oversized budget: cap it back to
+	 * policy. No-op for normal stints (their budget <= eff_slice()).
+	 */
+	{
+		u64 slice = eff_slice(p);
+
+		if (p->scx.slice > slice) {
+			p->scx.slice = slice;
+			__sync_fetch_and_add(&nr_dfl, 1);
+		}
 	}
 }
 
