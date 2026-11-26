@@ -238,7 +238,7 @@ void BPF_STRUCT_OPS(simple_tick, s32 cpu, struct task_struct *idle)
 {
 	__sync_fetch_and_add(&nr_tick, 1);
 
-	if (vtrace && cpu == (s32)tick_cpu) {
+	if (vtrace) {
 		struct task_struct *p = bpf_get_current_task_btf();
 		char comm[16];
 		u64 sl = p->scx.slice;
