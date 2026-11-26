@@ -241,10 +241,10 @@ void BPF_STRUCT_OPS(simple_tick, s32 cpu, struct task_struct *idle)
 	if (vtrace && cpu == (s32)tick_cpu) {
 		struct task_struct *p = bpf_get_current_task_btf();
 		char comm[16];
+		u64 sl = p->scx.slice;
 
 		__builtin_memcpy(comm, p->comm, sizeof(comm));
-		bpf_printk("TCK %d cur=%s sl=%llu now=%llu",
-			   cpu, comm, (u64)p->scx.slice, vtime_now);
+		bpf_printk("TCK %d cur=%s sl=%llu", cpu, comm, sl);
 	}
 }
 
