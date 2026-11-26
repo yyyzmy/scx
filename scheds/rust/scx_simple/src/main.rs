@@ -60,7 +60,7 @@ impl<'a> Scheduler<'a> {
 
         skel.maps.rodata_data.as_mut().unwrap().fifo_sched = opts.fifo_sched;
         skel.maps.bss_data.as_mut().unwrap().slice_base_ns = 2_800_000;
-        skel.maps.bss_data.as_mut().unwrap().preempt_en = 1;
+        skel.maps.bss_data.as_mut().unwrap().preempt_en = 0;
         skel.maps.bss_data.as_mut().unwrap().tick_cpu = 2;
 
         let mut skel = scx_ops_load!(skel, simple_ops, uei)?;
