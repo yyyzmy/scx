@@ -61,6 +61,7 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.as_mut().unwrap().fifo_sched = opts.fifo_sched;
         skel.maps.bss_data.as_mut().unwrap().slice_base_ns = 2_800_000;
         skel.maps.bss_data.as_mut().unwrap().preempt_en = 1;
+        skel.maps.bss_data.as_mut().unwrap().tick_cpu = 2;
 
         let mut skel = scx_ops_load!(skel, simple_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, simple_ops)?);
@@ -73,7 +74,7 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
-        let mut last = (0u64, 0u64, 0u64, 0u64);
+        let mut last = (0u64, 0u64, 0u64, 0u64, 0u64);
         let mut tick = 0u64;
         let mut slices: Vec<(String, u64)> = Vec::new(); /* userspace-side record for display */
 
@@ -93,7 +94,7 @@ impl<'a> Scheduler<'a> {
         });
 
         println!(
-            "commands: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US' | 'vtrace on|off'  (US = microseconds)"
+            "commands: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US' | 'vtrace on|off' | 'tickcpu N'  (US = microseconds)"
         );
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
@@ -109,6 +110,7 @@ impl<'a> Scheduler<'a> {
             let global = bss.nr_global_q;
             let wpre = bss.nr_wakeup_preempt;
             let kick = bss.nr_kick;
+            let n_tick = bss.nr_tick;
             let base_us = bss.slice_base_ns / 1000;
             let slices_str = if slices.is_empty() {
                 String::new()
@@ -123,15 +125,16 @@ impl<'a> Scheduler<'a> {
                 )
             };
             println!(
-                "[{tick:5}] base={base_us}us | local={} global={} | d local={} d global={} | d pre={} d kick={}{slices_str}",
+                "[{tick:5}] base={base_us}us | local={} global={} | d local={} d global={} | d pre={} d kick={} | d tick={}{slices_str}",
                 local,
                 global,
                 local - last.0,
                 global - last.1,
                 wpre - last.2,
-                kick - last.3
+                kick - last.3,
+                n_tick - last.4
             );
-            last = (local, global, wpre, kick);
+            last = (local, global, wpre, kick, n_tick);
         }
 
         let _ = self.struct_ops.take();
@@ -199,9 +202,16 @@ impl<'a> Scheduler<'a> {
                 self.skel.maps.bss_data.as_mut().unwrap().vtrace = 0;
                 println!("vtime trace: off");
             }
+            ["tickcpu", cpu] => match cpu.parse::<i64>() {
+                Ok(c) => {
+                    self.skel.maps.bss_data.as_mut().unwrap().tick_cpu = c as u64;
+                    println!("tick trace cpu: {c}");
+                }
+                Err(_) => println!("tickcpu: invalid cpu '{cpu}'"),
+            },
             [] => {}
             _ => println!(
-                "unknown command, try: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US' | 'vtrace on|off'"
+                "unknown command, try: 'slice NAME US' | 'unslice NAME' | 'base US' | 'preempt on|off' | 'gran US' | 'vtrace on|off' | 'tickcpu N'"
             ),
         }
     }

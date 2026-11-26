@@ -54,6 +54,8 @@ u64 nr_kick;            /* SCX_KICK_PREEMPT IPIs sent */
 u64 preempt_en;         /* 1 = waking tasks with credit may preempt */
 u64 preempt_gran_ns;    /* wakeup granularity gate in wall ns (0 = eager) */
 u64 vtrace;             /* 1 = print vtime decisions (enqueue/running/stopping) */
+u64 nr_tick;            /* ops.tick invocations; VM steal makes this rate sag */
+u64 tick_cpu;           /* with vtrace on, only this CPU prints TCK lines */
 
 /*
  * Per-comm custom slices: exact task comm (16B, NUL-padded) -> slice in ns.
@@ -223,6 +225,29 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
 	}
 }
 
+/*
+ * Tick probe. nr_tick counts every CPU's tick unconditionally: on a
+ * healthy machine that is nr_cpus * HZ per second, and any shortfall is
+ * wall time the guest never saw (VM steal / stalled vCPU). With vtrace
+ * on, the one CPU named by tick_cpu also prints each tick with the
+ * current task and its remaining slice: a multi-tick gap with a frozen
+ * sl=, bracketed by RUN/STP for the same task, means the vCPU went away
+ * mid-stint and the slice countdown froze with it.
+ */
+void BPF_STRUCT_OPS(simple_tick, s32 cpu, struct task_struct *idle)
+{
+	__sync_fetch_and_add(&nr_tick, 1);
+
+	if (vtrace && cpu == (s32)tick_cpu) {
+		struct task_struct *p = bpf_get_current_task_btf();
+		char comm[16];
+
+		__builtin_memcpy(comm, p->comm, sizeof(comm));
+		bpf_printk("TCK %d cur=%s sl=%llu now=%llu",
+			   cpu, comm, (u64)p->scx.slice, vtime_now);
+	}
+}
+
 void BPF_STRUCT_OPS(simple_enable, struct task_struct *p)
 {
 	p->scx.dsq_vtime = vtime_now;
@@ -244,6 +269,7 @@ SCX_OPS_DEFINE(simple_ops,
 	       .dispatch		= (void *)simple_dispatch,
 	       .running		= (void *)simple_running,
 	       .stopping		= (void *)simple_stopping,
+	       .tick			= (void *)simple_tick,
 	       .enable			= (void *)simple_enable,
 	       .init			= (void *)simple_init,
 	       .exit			= (void *)simple_exit,
