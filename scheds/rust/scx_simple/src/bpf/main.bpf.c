@@ -231,22 +231,23 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
  * comes from scx_bpf_task_cpu(p). nr_tick counts every CPU's tick
  * unconditionally: on a healthy machine that is (busy CPUs) * HZ per
  * second, and any shortfall is wall time the guest never saw (VM steal /
- * stalled vCPU). With vtrace on, each tick prints the current task and
- * its remaining slice: a multi-tick gap with a frozen sl=, bracketed by
- * RUN/STP for the same task, means the vCPU went away mid-stint and the
- * slice countdown froze with it.
+ * stalled vCPU). With vtrace on, the one CPU named by tick_cpu prints
+ * each tick with the current task and its remaining slice: a multi-tick
+ * gap with a frozen sl=, bracketed by RUN/STP for the same task, means
+ * the vCPU went away mid-stint and the slice countdown froze with it.
  */
 void BPF_STRUCT_OPS(simple_tick, struct task_struct *p, int nr_cpus)
 {
+	u32 cpu = scx_bpf_task_cpu(p);
+
 	__sync_fetch_and_add(&nr_tick, 1);
 
-	if (vtrace) {
+	if (vtrace && cpu == (u32)tick_cpu) {
 		char comm[16];
 		u64 sl = p->scx.slice;
 
 		__builtin_memcpy(comm, p->comm, sizeof(comm));
-		bpf_printk("TCK %d cur=%s sl=%llu",
-			   scx_bpf_task_cpu(p), comm, sl);
+		bpf_printk("TCK %d cur=%s sl=%llu", cpu, comm, sl);
 	}
 }
 
